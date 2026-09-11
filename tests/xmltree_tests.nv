@@ -1,0 +1,300 @@
+// xmltree_tests.nv — the API suite for the tolerant tree, the finds
+// over it, and the writer back out of it.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: xml-nv.<module>.<fn>`.
+//
+// THE TREE CASES ARE THE FOUR RECOVERIES.  `build` is tolerant of
+// exactly what `xmlerror.is_recoverable` names and of nothing else,
+// and the tests that keep that honest are the ones asserting that a
+// document with a mismatched end tag produces a TREE AND AN ISSUE —
+// not a tree, and not a fault.
+//
+// THE FIND CASES ARE ElementTree's OWN documented examples, from the
+// `xml.etree.ElementTree` tutorial's country-data document, because
+// they are the ones a reader coming from Python will try first.
+//
+// THE WRITER CASES ARE THE THREE ESCAPING RULES: character data,
+// attribute values, and the two constructs that have no escape at all.
+
+use std.test
+use std.list
+use xmlparse
+use xmlerror
+use xmltree
+use xmlfind
+use xmlwrite
+
+// ElementTree's tutorial document, reduced to what these tests ask
+// about: two countries, an attribute on each, a child element with
+// text, and a neighbour element with two attributes.
+fn countries() -> Str
+    let first = "<country name=\"Liechtenstein\"><rank>1</rank><neighbor name=\"Austria\" direction=\"E\"/></country>"
+    let second = "<country name=\"Singapore\"><rank>4</rank></country>"
+    "<data>${first}${second}</data>"
+
+@test
+fn test_a_well_formed_document_builds_a_tree_with_no_issues() [io]
+    test.case("the document node is 0 and the root element is under it")
+    let doc = xmltree.build("<a/>")
+    test.assert(xmltree.root(doc) == 0)
+    test.assert(xmltree.document_element(doc) == Some(1))
+    test.assert(list.len(xmltree.issues_of(doc)) == 0)
+
+    test.case("a comment before the root is a child of the document node")
+    let withcomment = xmltree.build("<!-- x --><a/>")
+    test.assert(list.len(xmltree.children(withcomment, 0)) == 2)
+    test.assert(xmltree.is_element(withcomment, 1) == false)
+
+    test.case("element_children skips text, comments and instructions")
+    let mixed = xmltree.build("<a> t <b/> <!-- c --> </a>")
+    test.assert(list.len(xmltree.element_children(mixed, 1)) == 1)
+
+@test
+fn test_the_tolerant_build_recovers_from_four_things_and_says_so() [io]
+    test.case("an end tag that does not match closes to the nearest ancestor")
+    let mismatched = xmltree.build("<a><b></a>")
+    test.assert(list.len(xmltree.issues_of(mismatched)) > 0)
+    test.assert(xmltree.document_element(mismatched) == Some(1))
+
+    test.case("a stray end tag is dropped and recorded")
+    let stray = xmltree.build("<a></b></a>")
+    let strayissues = xmltree.issues_of(stray)
+    test.assert(list.len(strayissues) > 0)
+    test.assert(list.get(strayissues, 0).kind == XmlStrayEnd)
+
+    test.case("a document that ends mid-element closes what is open")
+    let truncated = xmltree.build("<a><b>text")
+    test.assert(list.len(xmltree.issues_of(truncated)) > 0)
+
+    test.case("an undeclared prefix resolves to no namespace, and is recorded")
+    let unbound = xmltree.build("<p:a/>")
+    test.assert(xmltree.namespace_of(unbound, 1) == None)
+    test.assert(list.len(xmltree.issues_of(unbound)) > 0)
+
+    test.case("and build_strict refuses every one of them")
+    match xmltree.build_strict("<a></b></a>")
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(f.kind == XmlStrayEnd)
+
+    test.case("an issue renders to a line without the caller writing the match")
+    let doc = xmltree.build("<a></b></a>")
+    test.assert(xmltree.issue_text(doc, list.get(xmltree.issues_of(doc), 0)) != "")
+
+@test
+fn test_namespaces_are_resolved_on_the_tree() [io]
+    test.case("a prefix binds to the uri it was declared with")
+    let doc = xmltree.build("<p:a xmlns:p=\"urn:x\"><p:b/></p:a>")
+    test.assert(xmltree.tag_of(doc, 1) == "p:a")
+    test.assert(xmltree.local_of(doc, 1) == "a")
+    test.assert(xmltree.namespace_of(doc, 1) == Some("urn:x"))
+    test.assert(xmltree.namespace_uri(doc, "p") == Some("urn:x"))
+
+    test.case("an unprefixed attribute is in NO namespace, not the default one")
+    let dflt = xmltree.build("<a xmlns=\"urn:x\" id=\"1\"/>")
+    test.assert(xmltree.namespace_of(dflt, 1) == Some("urn:x"))
+    test.assert(xmltree.attr(dflt, 1, "id") == Some("1"))
+    test.assert(xmltree.attr_ns(dflt, 1, "urn:x", "id") == None)
+
+    test.case("an xmlns attribute stays in the attribute list, and says so")
+    let attrs = xmltree.attrs_of(dflt, 1)
+    test.assert(list.len(attrs) == 2)
+    test.assert(xmltree.is_namespace_decl(dflt, list.get(attrs, 0)))
+    test.assert(xmltree.is_namespace_decl(dflt, list.get(attrs, 1)) == false)
+
+@test
+fn test_text_is_a_node_s_own_and_inner_text_is_everything_under_it() [io]
+    test.case("an element has no text of its own; its children do")
+    let doc = xmltree.build("<a>x<b>y</b>z</a>")
+    test.assert(xmltree.text_of(doc, 1) == "")
+    test.assert(xmltree.inner_text(doc, 1) == "xyz")
+
+    test.case("entities are expanded on the way out")
+    let ent = xmltree.build("<a>x&amp;y</a>")
+    test.assert(xmltree.inner_text(ent, 1) == "x&y")
+
+    test.case("a CDATA section reads like text and writes back like a section")
+    let cd = xmltree.build("<a><![CDATA[<b>]]></a>")
+    test.assert(xmltree.inner_text(cd, 1) == "<b>")
+
+@test
+fn test_find_and_findall_answer_elementtree_s_own_examples() [io]
+    let doc = xmltree.build(countries())
+    let root = 1
+
+    test.case("findall over the children — the tutorial's first example")
+    test.assert(list.len(xmlfind.findall(doc, root, "country")) == 2)
+
+    test.case("find answers the first, and children only")
+    match xmlfind.find(doc, root, "country")
+        Some(i) => test.assert(xmltree.attr(doc, i, "name") == Some("Liechtenstein"))
+        None    => test.assert(false)
+    test.assert(xmlfind.find(doc, root, "rank") == None)
+
+    test.case("findtext reaches one level down")
+    match xmlfind.find(doc, root, "country")
+        Some(i) => test.assert(xmlfind.findtext(doc, i, "rank", "") == "1")
+        None    => test.assert(false)
+
+    test.case("the descendant walk is what .// meant, under its own name")
+    test.assert(list.len(xmlfind.findall_descendants(doc, root, "neighbor")) == 1)
+    test.assert(list.len(xmlfind.findall_descendants(doc, root, "rank")) == 2)
+
+    test.case("a star matches every element child")
+    test.assert(list.len(xmlfind.findall(doc, root, "*")) == 2)
+    test.assert(xmlfind.matches(doc, root, "*"))
+
+    test.case("by attribute — the [@attr='v'] predicate, as a call")
+    match xmlfind.find_by_attr(doc, root, "name", "Singapore")
+        Some(i) => test.assert(xmltree.tag_of(doc, i) == "country")
+        None    => test.assert(false)
+    let hits = xmlfind.findall_descendants_by_attr(doc, root, "direction", "E")
+    test.assert(list.len(hits) == 1)
+
+    test.case("and the [@attr] predicate, which is a different question")
+    test.assert(xmlfind.find_with_attr(doc, root, "name") != None)
+    test.assert(xmlfind.find_with_attr(doc, root, "direction") == None)
+
+@test
+fn test_the_walk_back_up_is_a_call_and_not_a_path() [io]
+    let doc = xmltree.build(countries())
+
+    test.case("ancestors are nearest first")
+    match xmlfind.find_descendant(doc, 1, "neighbor")
+        None    =>
+            test.assert(false)
+        Some(n) =>
+            let up = xmlfind.ancestors(doc, n)
+            test.assert(list.len(up) == 3)
+            test.assert(xmltree.tag_of(doc, list.get(up, 0)) == "country")
+
+    test.case("closest finds the nearest ancestor with a tag")
+    match xmlfind.find_descendant(doc, 1, "neighbor")
+        None    => test.assert(false)
+        Some(n) => test.assert(xmlfind.closest(doc, n, "data") == Some(1))
+
+@test
+fn test_the_writer_escapes_and_refuses_what_cannot_be_escaped() [io]
+    test.case("a round trip through the canonical options")
+    let doc = xmltree.build("<a id=\"1\">hi</a>")
+    test.assert(xmlwrite.serialize_str(doc, xmlwrite.canonical()) == "<a id=\"1\">hi</a>")
+
+    test.case("preserve puts an empty tag back the way it was written")
+    let selfclosed = xmltree.build("<a/>")
+    test.assert(xmlwrite.serialize_str(selfclosed, xmlwrite.preserve()) == "<a/>")
+
+    test.case("character data escapes the three, including the one XML permits")
+    let out = xmlwrite.write_text([], "a < b & c > d")
+    test.assert(list.len(out) == 23)
+
+    test.case("an attribute value escapes the quote it sits in and not the other")
+    let dq = xmlwrite.write_attr_value([], "he said \"hi\"", 34)
+    let sq = xmlwrite.write_attr_value([], "he said \"hi\"", 39)
+    test.assert(list.len(dq) > list.len(sq))
+
+    test.case("a name that is not a Name is refused, not written")
+    match xmlwrite.write_start_tag([], "not a name", [], xmlwrite.canonical())
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(f.kind == XmlBadName)
+
+    test.case("a comment holding -- is refused — XML gives it no escape")
+    match xmlwrite.write_comment([], " a -- b ")
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(f.kind == XmlBadComment)
+
+    test.case("a CDATA section holding ]]> is refused for the same reason")
+    match xmlwrite.write_cdata([], "a ]]> b")
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(f.kind == XmlBadCData)
+
+    test.case("a processing instruction may not claim the reserved target")
+    match xmlwrite.write_pi([], "XML", "x")
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(f.kind == XmlBadProcessingInstruction)
+
+    test.case("text that needs no escaping says so before the work is done")
+    test.assert(xmlwrite.escape_overhead("plain") == 0)
+    test.assert(xmlwrite.escape_overhead("a<b") > 0)
+
+@test
+fn test_a_scanner_and_a_tree_are_the_same_events() [io]
+    test.case("build_from takes a scanner the caller already has")
+    let s = xmlparse.scanner("<a>x</a>")
+    let doc = xmltree.build_from(s)
+    test.assert(xmltree.inner_text(doc, 1) == "x")
+
+    test.case("build_with takes the scanner's limits")
+    let bounded = xmltree.build_with("<a/>", xmlparse.default_limits())
+    test.assert(xmltree.count(bounded) == 2)
+
+    test.case("a node's span is the bytes it occupied, for a rewrite in place")
+    match xmltree.node(doc, 1)
+        None    => test.assert(false)
+        Some(n) =>
+            test.assert(n.span.start == 0)
+            test.assert(n.span.end == 8)
+
+    test.case("slice answers the source those bytes hold")
+    test.assert(xmltree.slice(doc, XmlRange { start: 0, end: 3 }) == "<a>")
+
+@test
+fn test_the_namespace_aware_finds_ignore_the_prefix_the_document_chose() [io]
+    test.case("two documents spelling one namespace differently agree here")
+    let atom = xmltree.build("<f xmlns:a=\"urn:atom\"><a:e><a:t>x</a:t></a:e></f>")
+    let same = xmltree.build("<f xmlns:z=\"urn:atom\"><z:e><z:t>x</z:t></z:e></f>")
+    test.assert(xmlfind.find_ns(atom, 1, "urn:atom", "e") != None)
+    test.assert(xmlfind.find_ns(same, 1, "urn:atom", "e") != None)
+    test.assert(list.len(xmlfind.findall_ns(atom, 1, "urn:atom", "e")) == 1)
+
+    test.case("and the descendant walk does too")
+    let deep = xmlfind.findall_descendants_ns(atom, 1, "urn:atom", "t")
+    test.assert(list.len(deep) == 1)
+
+    test.case("findtext_ns reads one level down by uri and local name")
+    match xmlfind.find_ns(atom, 1, "urn:atom", "e")
+        None    => test.assert(false)
+        Some(e) => test.assert(xmlfind.findtext_ns(atom, e, "urn:atom", "t", "") == "x")
+
+    test.case("a resolved name compares on the namespace, never the prefix")
+    match xmltree.name_of(atom, 2)
+        None    => test.assert(false)
+        Some(n) => test.assert(n.ns >= 0)
+
+@test
+fn test_the_rest_of_the_surface_answers_when_it_is_called() [io]
+    test.case("a scanner can be given limits of the caller's own")
+    let bounded = xmlparse.scanner_with("<a/>", xmlparse.default_limits())
+    test.assert(xmlparse.depth(bounded) == 0)
+
+    test.case("descendants is every node under one, in document order")
+    let doc = xmltree.build("<a><b>t</b></a>")
+    test.assert(list.len(xmltree.descendants(doc, 1)) == 2)
+
+    test.case("findall_by_attr answers every child, not the first")
+    let many = xmltree.build("<a><b k=\"x\"/><c k=\"x\"/><d k=\"y\"/></a>")
+    test.assert(list.len(xmlfind.findall_by_attr(many, 1, "k", "x")) == 2)
+
+    test.case("the pretty options indent and the canonical ones do not")
+    test.assert(xmlwrite.pretty().indent > 0)
+
+    test.case("serialize appends to the buffer it was given")
+    let out = xmlwrite.serialize([], doc, xmlwrite.canonical())
+    test.assert(list.len(out) > 0)
+
+    test.case("one node, and one node's children, are separate questions")
+    let whole = xmlwrite.serialize_node([], doc, 2, xmlwrite.canonical())
+    let inner = xmlwrite.serialize_children([], doc, 2, xmlwrite.canonical())
+    test.assert(list.len(whole) > list.len(inner))
+
+    test.case("the tag writers refuse a name and accept a Name")
+    match xmlwrite.write_end_tag([], "item")
+        Err(_)  => test.assert(false)
+        Ok(end) => test.assert(list.len(end) == 7)
+    match xmlwrite.write_empty_tag([], "br", [], xmlwrite.canonical())
+        Err(_) => test.assert(false)
+        Ok(br) => test.assert(list.len(br) == 5)
+
+    test.case("the declaration says UTF-8 because that is what this package reads")
+    let decl = xmlwrite.write_declaration([], Some(true))
+    let bare = xmlwrite.write_declaration([], None)
+    test.assert(list.len(decl) > list.len(bare))

@@ -1,0 +1,364 @@
+// xmlparse.nv — the pull parser: bytes in, events out, no tree.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE LOAD-BEARING INTERFACE OF THE PACKAGE IS `next_event`.  A
+// scanner value, an event, and the scanner that follows it — the state
+// is three integers and a small stack of open-element ranges, nothing
+// is allocated per event, and the caller decides when the next one
+// happens.  Everything else in this package is built on it:
+// `xmltree.build` is this loop with an arena under it, `xmlwrite` is
+// its inverse, and a caller streaming a 400 MB feed never calls either.
+//
+// EVERY EVENT IS A RANGE INTO THE SOURCE, never a copy.  A start tag
+// answers where its name is and where each attribute's name and value
+// are; text answers where the run of character data is.  That is what
+// makes a scan of a large document cost no allocation at all, and it
+// is why `decode` is a separate call: `&amp;` is not a substring of
+// the document, so a caller that needs the TEXT asks for it and a
+// caller that only needs to know an element was seen does not.
+//
+// THE SOURCE IS A `Str`, NOT `Bytes`, and the choice has a
+// consequence a reader should meet here rather than in a surprise.
+// novo-lang's `Str` is UTF-8, so this package reads UTF-8 and an
+// `<?xml encoding="ISO-8859-1"?>` is `XmlUnsupportedEncoding` rather
+// than a transcode: a `core` package has no encoding tables, and
+// answering Latin-1 bytes as if they were UTF-8 would corrupt text
+// silently rather than refuse loudly.  A caller holding other bytes
+// decodes them first.  The ranges are still BYTE offsets, so
+// everything above about zero copies holds.
+//
+// WHAT XML 1.0 IS NOT HERE.  The README lists it; the short version is
+// that there is no DTD beyond the five predefined entities, no
+// validation, no entity expansion of the caller's own entities, and no
+// XInclude.  A document that declares an internal subset is not
+// refused — the subset's bytes come back as one `XmlDoctype` event,
+// unparsed — but an `&mine;` inside it is `XmlBadEntity`.
+
+use xmlerror
+
+// The five predefined entities, and nothing else, are expanded.
+//
+// `&lt;` `&gt;` `&amp;` `&apos;` `&quot;`, plus `&#nn;` and `&#xNN;`.
+// A count rather than a list because a caller does not need the list;
+// it needs to know the number is five and not "whatever the DTD said".
+pub const PREDEFINED_ENTITIES = 5
+
+// A byte range into the source the caller holds.
+//
+// Half open: `start` is the first byte, `end` is one past the last, so
+// `end - start` is the length and an empty range has them equal.
+pub struct XmlRange
+    start: Int
+    end: Int
+
+// One attribute of a start or empty tag, as written.
+//
+// The name is the QUALIFIED name — `xmlns:foo` and `foo:bar` arrive
+// whole, prefix included — because prefixes are resolved on the tree
+// and not on the events.  `xmltree` is what splits them.
+pub struct XmlAttr
+    // The attribute's name, as written.
+    name: XmlRange
+    // The value between the quotes, quotes excluded.
+    value: XmlRange
+    // True when the value holds `&` and so is not the text it looks
+    // like.  A caller comparing an id against a literal checks this
+    // first and calls `decode` only when it is set, which for real
+    // documents is almost never.
+    needs_decoding: Bool
+    // Which quote the value was written with: `34` for `"` and `39`
+    // for `'`.  Kept so a rewriter can put the document back the way
+    // it found it.
+    quote: Int
+
+// What the scanner found.
+//
+// Nine arms, which is XML 1.0's own list of what can appear in a
+// document plus the end of it.  A pull parser that collapsed
+// `XmlEmptyTag` into a start and an end would lose the one thing a
+// rewriter needs to reproduce the source.
+pub enum XmlEventKind
+    // `<tag a="1">`: the qualified name and the attributes in source
+    // order.
+    XmlStartTag(name: XmlRange, attrs: [XmlAttr])
+    // `</tag>`: the qualified name.
+    XmlEndTag(name: XmlRange)
+    // `<tag a="1"/>`: a start and an end in one construct, and kept as
+    // one so that `xmlwrite` can write back what was written.
+    XmlEmptyTag(name: XmlRange, attrs: [XmlAttr])
+    // A run of character data between markup.  `needs_decoding` is set
+    // when it holds `&`; whitespace-only runs are reported like any
+    // other, because in XML — unlike HTML — whitespace inside an
+    // element is content until a schema says otherwise, and this
+    // package has no schema.
+    XmlText(text: XmlRange, needs_decoding: Bool)
+    // `<![CDATA[...]]>`: the contents, delimiters excluded.  Never
+    // decoded — that is what a CDATA section is for — and kept apart
+    // from `XmlText` so a rewriter can put the section back.
+    XmlCData(text: XmlRange)
+    // `<!-- ... -->`: the contents, delimiters excluded.
+    XmlComment(text: XmlRange)
+    // `<?target data?>`: the target and everything after the first
+    // space, `?>` excluded.  `data` is an empty range for `<?tgt?>`.
+    XmlProcessingInstruction(target: XmlRange, data: XmlRange)
+    // `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>`, whose
+    // pseudo-attributes are parsed because the encoding one decides
+    // whether this package can read the document at all.
+    XmlDeclaration(version: XmlRange, encoding: XmlRange, standalone: XmlRange)
+    // `<!DOCTYPE ...>`, WHOLE AND UNPARSED — the range covers `<!` to
+    // the matching `>`, internal subset included, and nothing in this
+    // package looks inside it.  A caller that needs the subset has the
+    // bytes; a caller that does not can skip the event.
+    XmlDoctype(text: XmlRange)
+    // The document ended.  The last event of every successful scan,
+    // and the one a `while` loop stops on.
+    XmlEof
+
+// An event and where it was.
+pub struct XmlEvent
+    kind: XmlEventKind
+    // The byte range of the whole construct, delimiters included.
+    // What a tool that REWRITES a document in place needs: replace
+    // these bytes and leave the rest untouched.
+    span: XmlRange
+
+// What the scanner will not do.
+//
+// Bounds rather than a promise of termination: XML's pathological
+// inputs are a file of 200,000 nested elements and an element with a
+// million attributes, and both are a few lines to write.  There is no
+// entity-expansion bound because there is no entity expansion — the
+// billion-laughs attack needs an internal DTD subset, and this package
+// does not read one.
+pub struct XmlLimits
+    // How deeply elements may nest before `XmlLimitExceeded`.
+    max_depth: Int
+    // How many attributes one element may carry.
+    max_attributes: Int
+    // How long a single name may be, in bytes.  A guard on the one
+    // construct that can grow without a delimiter in sight.
+    max_name_length: Int
+
+// The scanner between two events.
+//
+// A value, so a caller can hold one, copy one, or keep two over the
+// same source.  `open` is the stack of qualified-name ranges of the
+// elements that are open — the one thing a scanner must carry to
+// answer `XmlMismatchedEnd` — and it is ranges rather than strings
+// because a name is already in the source.
+pub struct XmlScanner
+    // The document.  Held here because a range without its string is
+    // meaningless.
+    source: Str
+    // How far the scan has reached.
+    at: Int
+    // The qualified names of the currently open elements, outermost
+    // first.
+    open: [XmlRange]
+    limits: XmlLimits
+    // True once the root element has closed, so that trailing content
+    // can be told from content.
+    after_root: Bool
+
+// An event and the scanner that follows it.
+pub struct XmlStep
+    scanner: XmlScanner
+    event: XmlEvent
+
+// Bounds no real document reaches: 256 deep, 4096 attributes, names of
+// 1024 bytes.
+//
+// ```novo
+// use xmlparse
+//
+// fn main() [io]
+//     println("${xmlparse.default_limits().max_depth}")
+// ```
+pub fn default_limits() -> XmlLimits []
+    todo("xml-nv.xmlparse.default_limits")
+
+// A scanner over a source string, at the default limits.
+//
+// ```novo
+// use xmlparse
+//
+// fn main() [io]
+//     let s = xmlparse.scanner("<a/>")
+//     println("${s.at}")
+// ```
+pub fn scanner(source: Str) -> XmlScanner []
+    todo("xml-nv.xmlparse.scanner")
+
+// A scanner with limits of the caller's choosing.
+//
+// ```novo
+// use xmlparse
+//
+// fn main() [io]
+//     let s = xmlparse.scanner_with("<a/>", xmlparse.default_limits())
+//     println("${s.at}")
+// ```
+pub fn scanner_with(source: Str, limits: XmlLimits) -> XmlScanner []
+    todo("xml-nv.xmlparse.scanner_with")
+
+// The next event, or the fault that stopped the scan.
+//
+// **The load-bearing interface.**  Call it until the kind is `XmlEof`.
+// The scanner in the step is the one to call it on next; the one
+// passed in is unchanged, so a caller that wants to look ahead and
+// then not can simply drop the step.
+//
+// It is fatal on a well-formedness error because XML 1.0 § 1.2 says a
+// processor must not continue past one.  `xmltree.build` is the
+// tolerant reading of the same events, and it is built on this
+// function rather than on a second scanner.
+//
+// ```novo
+// use xmlparse
+//
+// fn main() [io]
+//     match xmlparse.next_event(xmlparse.scanner("<a>hi</a>"))
+//         Err(f)   => println("${f.at}")
+//         Ok(step) =>
+//             match step.event.kind
+//                 XmlStartTag(name, _) => println(xmlparse.text_at(step.scanner, name))
+//                 _                    => println("not a start tag")
+// ```
+pub fn next_event(s: XmlScanner) -> Result<XmlStep, xmlerror.XmlFault> []
+    todo("xml-nv.xmlparse.next_event")
+
+// How deep the scanner currently is: the number of open elements.
+//
+// ```novo
+// use xmlparse
+//
+// fn main() [io]
+//     let s = xmlparse.scanner("<a><b/></a>")
+//     println("${xmlparse.depth(s)}")
+// ```
+pub fn depth(s: XmlScanner) -> Int []
+    todo("xml-nv.xmlparse.depth")
+
+// The source text a range names, exactly as written.
+//
+// No decoding: `&amp;` comes back as `&amp;`.  What a caller comparing
+// a tag name against a literal wants, because a tag name cannot
+// contain an entity reference in the first place.
+//
+// ```novo
+// use xmlparse
+//
+// fn main() [io]
+//     let s = xmlparse.scanner("<a/>")
+//     println(xmlparse.text_at(s, XmlRange { start: 1, end: 2 }))
+// ```
+pub fn text_at(s: XmlScanner, r: XmlRange) -> Str []
+    todo("xml-nv.xmlparse.text_at")
+
+// The source text a range names, with entity and character references
+// expanded.
+//
+// The five predefined entities and `&#nn;` / `&#xNN;`.  Anything else
+// is `XmlBadEntity`, with the offset of the `&`.  Call it only when
+// the event said `needs_decoding`; on a range with no `&` in it the
+// answer is `text_at`'s and the check is a scan the caller did not
+// need.
+//
+// ```novo
+// use xmlparse
+//
+// fn main() [io]
+//     let s = xmlparse.scanner("<a>x&amp;y</a>")
+//     match xmlparse.decode(s, XmlRange { start: 3, end: 9 })
+//         Ok(t)  => println(t)
+//         Err(_) => println("bad entity")
+// ```
+pub fn decode(s: XmlScanner, r: XmlRange) -> Result<Str, xmlerror.XmlFault> []
+    todo("xml-nv.xmlparse.decode")
+
+// The code point one of the five predefined entity names stands for,
+// or `None`.
+//
+// `"lt"` is 60, `"gt"` 62, `"amp"` 38, `"apos"` 39, `"quot"` 34 — the
+// names WITHOUT the `&` and the `;`.  Public because a caller writing
+// its own decoder over the same ranges should not have to re-type the
+// table, and because it is how a reader checks that the five really
+// are all of them.
+//
+// ```novo
+// use xmlparse
+//
+// fn main() [io]
+//     match xmlparse.entity_value("amp")
+//         Some(c) => println("${c}")
+//         None    => println("not predefined")
+// ```
+pub fn entity_value(name: Str) -> ?Int []
+    todo("xml-nv.xmlparse.entity_value")
+
+// Whether a code point is allowed in an XML 1.0 document at all.
+//
+// The Char production: tab, newline, carriage return, then U+0020 to
+// U+D7FF, U+E000 to U+FFFD, U+10000 to U+10FFFF.  Surrogates and most
+// C0 controls are not characters in XML, which is why `&#0;` is a
+// fault and not a NUL.
+//
+// ```novo
+// use xmlparse
+//
+// fn main() [io]
+//     println("${xmlparse.is_xml_char(9)}")
+// ```
+pub fn is_xml_char(code: Int) -> Bool []
+    todo("xml-nv.xmlparse.is_xml_char")
+
+// Whether a string is an XML 1.0 Name.
+//
+// The NameStartChar and NameChar productions: a letter, `_` or `:` to
+// start, then letters, digits, `.`, `-`, `_` and `:`.  Used by
+// `xmlwrite` before it writes a tag a caller supplied, so that a
+// serialiser cannot be talked into emitting `<a><script>` from a name.
+//
+// ```novo
+// use xmlparse
+//
+// fn main() [io]
+//     let ok = xmlparse.is_name("item")
+//     println("${ok}")
+// ```
+pub fn is_name(s: Str) -> Bool []
+    todo("xml-nv.xmlparse.is_name")
+
+// The 1-based line a byte offset falls on.
+//
+// A scan from the start of the source, so a caller that wants a
+// position for every event should keep its own counter instead.  This
+// is for the one offset in a fault.
+//
+// ```novo
+// use xmlparse
+//
+// fn main() [io]
+//     let s = xmlparse.scanner("<a>hi</a>")
+//     println("${xmlparse.line_of(s, 4)}")     // 1 — no newline before it
+// ```
+pub fn line_of(s: XmlScanner, offset: Int) -> Int []
+    todo("xml-nv.xmlparse.line_of")
+
+// The 1-based column, in bytes, a byte offset falls on.
+//
+// Bytes rather than characters: a column in characters needs a
+// grapheme table, and this package does not carry one.  A diagnostic
+// that underlines with the source beside it gets the right answer
+// anyway.
+//
+// ```novo
+// use xmlparse
+//
+// fn main() [io]
+//     let s = xmlparse.scanner("<a>hi</a>")
+//     println("${xmlparse.column_of(s, 4)}")   // 5
+// ```
+pub fn column_of(s: XmlScanner, offset: Int) -> Int []
+    todo("xml-nv.xmlparse.column_of")

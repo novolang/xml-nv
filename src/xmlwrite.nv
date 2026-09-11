@@ -1,0 +1,345 @@
+// xmlwrite.nv — a tree, or a piece of one, back out as XML, appended
+// to a buffer the caller owns.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// NOTHING HERE WRITES.  Every function takes the buffer to append to
+// and answers it back, so a program that is building a 40 MB feed
+// keeps one buffer and writes once, and a test asserts on bytes with
+// no file in the room.  `docs/publishing.md` § Design is explicit that
+// a library returns the text or takes the writer, and this package has
+// no effects with which to do otherwise even if it wanted to.
+//
+// ESCAPING IS THE WHOLE JOB, and it is different in three places.
+// `&` and `<` must be escaped in character data; `>` need not be, and
+// is anyway, because `]]>` in text is a fault and escaping the `>`
+// makes the rule unnecessary.  In an attribute value the quote that
+// delimits it must be escaped and the other need not be.  In a
+// comment, nothing may be escaped at all — a comment cannot contain
+// `--` and there is no spelling that makes it able to — so
+// `write_comment` REFUSES rather than mangles.  Those three rules are
+// why there are three escape functions and not one.
+//
+// THE WRITER CANNOT BE TALKED INTO MALFORMED OUTPUT.  Every function
+// that takes a name checks it against `xmlparse.is_name` first, and
+// every one that takes text escapes it.  A caller that concatenated a
+// tag out of user input gets a `Result` back rather than a document
+// with an injected element in it, which is the XML half of the same
+// problem html-nv's `htmlsafe` exists for.
+
+use xmlerror
+use xmlparse
+use xmltree
+
+// What a serialisation looks like.
+//
+// `canonical()` is the shape to use for a document a machine reads;
+// `preserve()` is the one for a document a person edits and a tool is
+// changing part of.
+pub struct XmlWriteOptions
+    // Spaces of indentation per level of nesting.  `0` writes no
+    // whitespace at all, which is what a canonical form and a wire
+    // format both want.
+    indent: Int
+    // Write `<a/>` for an element with no children.  When false, every
+    // element gets an end tag.
+    self_close_empty: Bool
+    // Write `<?xml version="1.0" encoding="UTF-8"?>` first.
+    declaration: Bool
+    // The quote to write attribute values with: `34` for `"`, `39`
+    // for `'`.
+    quote: Int
+    // Write each element the way the source wrote it — `<a/>` where
+    // the source said `<a/>`, the source's own quote on each
+    // attribute, CDATA sections back as CDATA — rather than the way
+    // these options say.  What a tool changing one element of a
+    // person's file needs; it makes `build` then `serialize` the
+    // identity on a well-formed document, so the diff shows only what
+    // the tool changed.
+    preserve_shape: Bool
+
+// Compact, no declaration, `<a/>` for empty elements, double quotes.
+//
+// ```novo
+// use xmlwrite
+//
+// fn main() [io]
+//     println("${xmlwrite.canonical().indent}")
+// ```
+pub fn canonical() -> XmlWriteOptions []
+    todo("xml-nv.xmlwrite.canonical")
+
+// Two-space indentation, a declaration, `<a/>` for empty elements.
+//
+// ```novo
+// use xmlwrite
+//
+// fn main() [io]
+//     println("${xmlwrite.pretty().indent}")
+// ```
+pub fn pretty() -> XmlWriteOptions []
+    todo("xml-nv.xmlwrite.pretty")
+
+// The options that reproduce the source: `preserve_shape` set, no
+// declaration added, nothing indented.
+//
+// ```novo
+// use xmlwrite
+//
+// fn main() [io]
+//     println("${xmlwrite.preserve().preserve_shape}")
+// ```
+pub fn preserve() -> XmlWriteOptions []
+    todo("xml-nv.xmlwrite.preserve")
+
+// A whole document, appended to `out`.
+//
+// ```novo
+// use std.list
+// use xmltree
+// use xmlwrite
+//
+// fn main() [io]
+//     let doc = xmltree.build("<a>hi</a>")
+//     let out = xmlwrite.serialize([], doc, xmlwrite.canonical())
+//     println("${list.len(out)}")
+// ```
+pub fn serialize(out: [u8], doc: xmltree.XmlDocument, options: XmlWriteOptions) -> [u8] []
+    todo("xml-nv.xmlwrite.serialize")
+
+// One node and everything under it, appended to `out`.
+//
+// What a caller extracting one record from a feed writes: find the
+// `<item>`, serialise it, drop the rest.
+//
+// ```novo
+// use std.list
+// use xmltree
+// use xmlwrite
+//
+// fn main() [io]
+//     let doc = xmltree.build("<a><b>hi</b></a>")
+//     let out = xmlwrite.serialize_node([], doc, 2, xmlwrite.canonical())
+//     println("${list.len(out)}")
+// ```
+pub fn serialize_node(out: [u8], doc: xmltree.XmlDocument, index: Int,
+                      options: XmlWriteOptions) -> [u8] []
+    todo("xml-nv.xmlwrite.serialize_node")
+
+// A node's children, appended to `out`, the node itself not written.
+//
+// The inner-XML case: replacing an element's contents without
+// touching its tag.
+//
+// ```novo
+// use std.list
+// use xmltree
+// use xmlwrite
+//
+// fn main() [io]
+//     let doc = xmltree.build("<a><b/><c/></a>")
+//     let out = xmlwrite.serialize_children([], doc, 1, xmlwrite.canonical())
+//     println("${list.len(out)}")
+// ```
+pub fn serialize_children(out: [u8], doc: xmltree.XmlDocument, index: Int,
+                          options: XmlWriteOptions) -> [u8] []
+    todo("xml-nv.xmlwrite.serialize_children")
+
+// The convenience for a caller with no buffer to reuse.
+//
+// It allocates one, serialises into it and answers a string; a caller
+// writing many documents should keep its own buffer and call
+// `serialize`.
+//
+// ```novo
+// use xmltree
+// use xmlwrite
+//
+// fn main() [io]
+//     let doc = xmltree.build("<a>hi</a>")
+//     println(xmlwrite.serialize_str(doc, xmlwrite.canonical()))
+// ```
+pub fn serialize_str(doc: xmltree.XmlDocument, options: XmlWriteOptions) -> Str []
+    todo("xml-nv.xmlwrite.serialize_str")
+
+// One attribute a caller is building by hand.
+//
+// A pair of strings rather than an `xmltree.XmlTreeAttr`, because the
+// caller building a document from its own data has no tree and no
+// ranges to make one out of.
+pub struct XmlWriteAttr
+    name: Str
+    value: Str
+
+// A start tag from a name and attributes the caller holds as strings.
+//
+// `Err(XmlBadName)` when the tag or an attribute name is not an XML
+// Name — the check that keeps a document built from user input from
+// carrying an element nobody meant to write.  Values are escaped.
+//
+// ```novo
+// use std.list
+// use xmlwrite
+//
+// fn main() [io]
+//     match xmlwrite.write_start_tag([], "item", [], xmlwrite.canonical())
+//         Ok(out) => println("${list.len(out)}")
+//         Err(_)  => println("not a name")
+// ```
+pub fn write_start_tag(out: [u8], tag: Str, attrs: [XmlWriteAttr],
+                       options: XmlWriteOptions) -> Result<[u8], xmlerror.XmlFault> []
+    todo("xml-nv.xmlwrite.write_start_tag")
+
+// An end tag from a name the caller holds.
+//
+// ```novo
+// use std.list
+// use xmlwrite
+//
+// fn main() [io]
+//     match xmlwrite.write_end_tag([], "item")
+//         Ok(out) => println("${list.len(out)}")
+//         Err(_)  => println("not a name")
+// ```
+pub fn write_end_tag(out: [u8], tag: Str) -> Result<[u8], xmlerror.XmlFault> []
+    todo("xml-nv.xmlwrite.write_end_tag")
+
+// An empty tag — `<item a="1"/>` — from a name and attributes.
+//
+// ```novo
+// use std.list
+// use xmlwrite
+//
+// fn main() [io]
+//     match xmlwrite.write_empty_tag([], "br", [], xmlwrite.canonical())
+//         Ok(out) => println("${list.len(out)}")
+//         Err(_)  => println("not a name")
+// ```
+pub fn write_empty_tag(out: [u8], tag: Str, attrs: [XmlWriteAttr],
+                       options: XmlWriteOptions) -> Result<[u8], xmlerror.XmlFault> []
+    todo("xml-nv.xmlwrite.write_empty_tag")
+
+// Character data, escaped.
+//
+// `&` becomes `&amp;`, `<` becomes `&lt;`, `>` becomes `&gt;`.  The
+// third is not required by XML 1.0 and is done anyway, because the
+// only rule about `>` in character data is that `]]>` may not appear,
+// and escaping every `>` makes that rule unnecessary rather than
+// conditional.
+//
+// ```novo
+// use std.list
+// use xmlwrite
+//
+// fn main() [io]
+//     let out = xmlwrite.write_text([], "a < b")
+//     println("${list.len(out)}")
+// ```
+pub fn write_text(out: [u8], text: Str) -> [u8] []
+    todo("xml-nv.xmlwrite.write_text")
+
+// An attribute value's contents, escaped for the quote it will sit in.
+//
+// `&` and `<` always; the delimiting quote; and tab, newline and
+// carriage return as numeric references, because an attribute value's
+// whitespace is normalised on the way back in and a literal newline
+// would not survive a round trip.
+//
+// ```novo
+// use std.list
+// use xmlwrite
+//
+// fn main() [io]
+//     let out = xmlwrite.write_attr_value([], "a \"quoted\" b", 34)
+//     println("${list.len(out)}")
+// ```
+pub fn write_attr_value(out: [u8], value: Str, quote: Int) -> [u8] []
+    todo("xml-nv.xmlwrite.write_attr_value")
+
+// A CDATA section around text that is written verbatim.
+//
+// `Err(XmlBadCData)` when the text contains `]]>`, because there is no
+// escape for it inside a section and the only correct answer is two
+// sections — which is a decision about the document that belongs to
+// the caller, not to the writer.
+//
+// ```novo
+// use std.list
+// use xmlwrite
+//
+// fn main() [io]
+//     match xmlwrite.write_cdata([], "a < b")
+//         Ok(out) => println("${list.len(out)}")
+//         Err(_)  => println("the text closes the section")
+// ```
+pub fn write_cdata(out: [u8], text: Str) -> Result<[u8], xmlerror.XmlFault> []
+    todo("xml-nv.xmlwrite.write_cdata")
+
+// A comment.
+//
+// `Err(XmlBadComment)` when the text contains `--` or ends in `-`.
+// Nothing is escaped and nothing can be: XML gives a comment no escape
+// mechanism at all, so a writer that accepted `--` would be writing a
+// document no parser reads.
+//
+// ```novo
+// use std.list
+// use xmlwrite
+//
+// fn main() [io]
+//     match xmlwrite.write_comment([], " generated ")
+//         Ok(out) => println("${list.len(out)}")
+//         Err(_)  => println("a comment may not contain --")
+// ```
+pub fn write_comment(out: [u8], text: Str) -> Result<[u8], xmlerror.XmlFault> []
+    todo("xml-nv.xmlwrite.write_comment")
+
+// A processing instruction.
+//
+// `Err(XmlBadProcessingInstruction)` when the target is `xml` in any
+// case — that one is reserved for the declaration — or when the data
+// contains `?>`.
+//
+// ```novo
+// use std.list
+// use xmlwrite
+//
+// fn main() [io]
+//     match xmlwrite.write_pi([], "xml-stylesheet", "href=\"s.xsl\"")
+//         Ok(out) => println("${list.len(out)}")
+//         Err(_)  => println("reserved target, or ?> in the data")
+// ```
+pub fn write_pi(out: [u8], target: Str, data: Str) -> Result<[u8], xmlerror.XmlFault> []
+    todo("xml-nv.xmlwrite.write_pi")
+
+// The XML declaration.
+//
+// Always `version="1.0" encoding="UTF-8"`, because those are the only
+// two this package reads.  `standalone` is written when it is `Some`.
+//
+// ```novo
+// use std.list
+// use xmlwrite
+//
+// fn main() [io]
+//     let out = xmlwrite.write_declaration([], None)
+//     println("${list.len(out)}")
+// ```
+pub fn write_declaration(out: [u8], standalone: ?Bool) -> [u8] []
+    todo("xml-nv.xmlwrite.write_declaration")
+
+// How many bytes escaping this text will add.
+//
+// For a caller sizing a buffer before it starts, and for a caller
+// deciding whether a value needs escaping at all: an answer of `0`
+// means the text can be appended as it is.
+//
+// ```novo
+// use xmlwrite
+//
+// fn main() [io]
+//     let extra = xmlwrite.escape_overhead("plain")
+//     println("${extra}")
+// ```
+pub fn escape_overhead(text: Str) -> Int []
+    todo("xml-nv.xmlwrite.escape_overhead")

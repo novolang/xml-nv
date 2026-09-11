@@ -1,0 +1,318 @@
+// xmlfind.nv — ElementTree's find and findall, as arithmetic over the
+// arena.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THERE IS NO XPath HERE, AND THAT IS THE DESIGN RATHER THAN A GAP.
+// ElementTree ships a "limited XPath subset" whose limits nobody can
+// state: it has `//`, predicates, `[@attr='v']`, `[position()]` and
+// `..`, and it silently does not have axes, functions, unions or
+// anything else, so a caller who knows XPath writes an expression that
+// parses and answers the wrong nodes.  Every function in this module
+// is a named walk instead — children, descendants, by tag, by
+// attribute — and a caller who needs a path language over a tree can
+// see from the signatures that this is not one.
+//
+// A RESULT IS A LIST OF INDICES, in document order, never a list of
+// nodes.  An index is eight bytes, comparable, stable for the life of
+// the document, and usable as an argument to everything in `xmltree`;
+// a node would be a copy of a struct holding six more integers.  A
+// `findall` over a 50,000-element feed is one list of integers.
+//
+// MATCHING IS ON THE LOCAL NAME AND THE NAMESPACE, never on the
+// prefix, in the `_ns` half of each pair — because a prefix is a
+// spelling the document chose and two documents in one namespace may
+// spell it differently.  The plain half matches the QUALIFIED name as
+// written, which is what a caller with a namespace-free document
+// wants and what makes the common case one argument.
+
+use xmltree
+
+// The tag that matches every element.
+//
+// ElementTree spells it `"*"` and so does this: `findall(doc, i, "*")`
+// is every element child.  A constant rather than a literal in the
+// documentation, because it is the one string in this module whose
+// value is a decision.
+pub const XML_ANY_TAG = "*"
+
+// The first element child with this tag, or `None`.
+//
+// ElementTree's `find`.  Children only — not descendants — which is
+// the half of `find` people forget and the reason `find_descendant`
+// has a different name here rather than a different argument.
+//
+// ```novo
+// use xmltree
+// use xmlfind
+//
+// fn main() [io]
+//     let doc = xmltree.build("<a><b/><c/></a>")
+//     match xmlfind.find(doc, 1, "c")
+//         Some(i) => println(xmltree.tag_of(doc, i))
+//         None    => println("absent")
+// ```
+pub fn find(doc: xmltree.XmlDocument, from: Int, tag: Str) -> ?Int []
+    todo("xml-nv.xmlfind.find")
+
+// Every element child with this tag, in source order.
+//
+// ElementTree's `findall`.  `XML_ANY_TAG` matches every element.
+//
+// ```novo
+// use std.list
+// use xmltree
+// use xmlfind
+//
+// fn main() [io]
+//     let doc = xmltree.build("<a><b/><b/><c/></a>")
+//     let hits = xmlfind.findall(doc, 1, "b")
+//     println("${list.len(hits)}")
+// ```
+pub fn findall(doc: xmltree.XmlDocument, from: Int, tag: Str) -> [Int] []
+    todo("xml-nv.xmlfind.findall")
+
+// The first element child in this namespace with this local name.
+//
+// ```novo
+// use xmltree
+// use xmlfind
+//
+// fn main() [io]
+//     let doc = xmltree.build("<a xmlns:p=\"urn:x\"><p:b/></a>")
+//     match xmlfind.find_ns(doc, 1, "urn:x", "b")
+//         Some(i) => println(xmltree.local_of(doc, i))
+//         None    => println("absent")
+// ```
+pub fn find_ns(doc: xmltree.XmlDocument, from: Int, uri: Str, local: Str) -> ?Int []
+    todo("xml-nv.xmlfind.find_ns")
+
+// Every element child in this namespace with this local name.
+//
+// ```novo
+// use std.list
+// use xmltree
+// use xmlfind
+//
+// fn main() [io]
+//     let doc = xmltree.build("<a xmlns:p=\"urn:x\"><p:b/><p:b/></a>")
+//     let hits = xmlfind.findall_ns(doc, 1, "urn:x", "b")
+//     println("${list.len(hits)}")
+// ```
+pub fn findall_ns(doc: xmltree.XmlDocument, from: Int, uri: Str, local: Str) -> [Int] []
+    todo("xml-nv.xmlfind.findall_ns")
+
+// The first DESCENDANT element with this tag, in document order.
+//
+// What a caller who wrote `.//tag` in ElementTree meant.  Named
+// differently rather than spelled differently so that the difference
+// between "my children" and "everything under me" is visible at the
+// call site instead of in two characters of a string.
+//
+// ```novo
+// use xmltree
+// use xmlfind
+//
+// fn main() [io]
+//     let doc = xmltree.build("<a><b><c/></b></a>")
+//     match xmlfind.find_descendant(doc, 1, "c")
+//         Some(i) => println(xmltree.tag_of(doc, i))
+//         None    => println("absent")
+// ```
+pub fn find_descendant(doc: xmltree.XmlDocument, from: Int, tag: Str) -> ?Int []
+    todo("xml-nv.xmlfind.find_descendant")
+
+// Every descendant element with this tag, in document order.
+//
+// ElementTree's `iter(tag)`.  The node itself is not a candidate, so
+// `findall_descendants(doc, i, tag_of(doc, i))` does not answer `i`.
+//
+// ```novo
+// use std.list
+// use xmltree
+// use xmlfind
+//
+// fn main() [io]
+//     let doc = xmltree.build("<a><b><c/></b><c/></a>")
+//     let hits = xmlfind.findall_descendants(doc, 1, "c")
+//     println("${list.len(hits)}")
+// ```
+pub fn findall_descendants(doc: xmltree.XmlDocument, from: Int, tag: Str) -> [Int] []
+    todo("xml-nv.xmlfind.findall_descendants")
+
+// Every descendant element in this namespace with this local name.
+//
+// ```novo
+// use std.list
+// use xmltree
+// use xmlfind
+//
+// fn main() [io]
+//     let doc = xmltree.build("<a xmlns:p=\"urn:x\"><q><p:b/></q></a>")
+//     let hits = xmlfind.findall_descendants_ns(doc, 1, "urn:x", "b")
+//     println("${list.len(hits)}")
+// ```
+pub fn findall_descendants_ns(doc: xmltree.XmlDocument, from: Int, uri: Str, local: Str) -> [Int] []
+    todo("xml-nv.xmlfind.findall_descendants_ns")
+
+// The first element child carrying this attribute with this value.
+//
+// The `[@attr='v']` predicate, as a call.  `value` is compared against
+// the DECODED attribute value, so `&amp;` in the document matches `&`
+// in the argument.
+//
+// ```novo
+// use xmltree
+// use xmlfind
+//
+// fn main() [io]
+//     let doc = xmltree.build("<a><b id=\"1\"/><b id=\"2\"/></a>")
+//     match xmlfind.find_by_attr(doc, 1, "id", "2")
+//         Some(i) => println(xmltree.attr(doc, i, "id") ?? "")
+//         None    => println("absent")
+// ```
+pub fn find_by_attr(doc: xmltree.XmlDocument, from: Int, name: Str, value: Str) -> ?Int []
+    todo("xml-nv.xmlfind.find_by_attr")
+
+// Every element child carrying this attribute with this value.
+//
+// ```novo
+// use std.list
+// use xmltree
+// use xmlfind
+//
+// fn main() [io]
+//     let doc = xmltree.build("<a><b k=\"x\"/><c k=\"x\"/></a>")
+//     let hits = xmlfind.findall_by_attr(doc, 1, "k", "x")
+//     println("${list.len(hits)}")
+// ```
+pub fn findall_by_attr(doc: xmltree.XmlDocument, from: Int, name: Str, value: Str) -> [Int] []
+    todo("xml-nv.xmlfind.findall_by_attr")
+
+// The first element child carrying this attribute at all.
+//
+// The `[@attr]` predicate.  Separate from `find_by_attr` because
+// "has an href" and "has an href of exactly this" are different
+// questions and a sentinel value for "any" would be a value some
+// document really has.
+//
+// ```novo
+// use xmltree
+// use xmlfind
+//
+// fn main() [io]
+//     let doc = xmltree.build("<a><b/><c href=\"u\"/></a>")
+//     match xmlfind.find_with_attr(doc, 1, "href")
+//         Some(i) => println(xmltree.tag_of(doc, i))
+//         None    => println("absent")
+// ```
+pub fn find_with_attr(doc: xmltree.XmlDocument, from: Int, name: Str) -> ?Int []
+    todo("xml-nv.xmlfind.find_with_attr")
+
+// Every descendant element carrying this attribute with this value.
+//
+// The one combination a scraper reaches for first — find every
+// `<link rel="alternate">` anywhere under the feed — and the reason
+// it is spelled out rather than composed: composing it means building
+// the descendant list and filtering it, which allocates twice.
+//
+// ```novo
+// use std.list
+// use xmltree
+// use xmlfind
+//
+// fn main() [io]
+//     let doc = xmltree.build("<a><b><c r=\"alt\"/></b></a>")
+//     let hits = xmlfind.findall_descendants_by_attr(doc, 1, "r", "alt")
+//     println("${list.len(hits)}")
+// ```
+pub fn findall_descendants_by_attr(doc: xmltree.XmlDocument, from: Int, name: Str,
+                                   value: Str) -> [Int] []
+    todo("xml-nv.xmlfind.findall_descendants_by_attr")
+
+// The inner text of the first element child with this tag, or a
+// default.
+//
+// ElementTree's `findtext`.  The text is every descendant text node
+// and CDATA section concatenated — `xmltree.inner_text` — and not just
+// the first child, because `<title>a<b/>c</title>` has a title of
+// `"ac"` and a library that answered `"a"` would be wrong on every
+// document with an entity in a title.
+//
+// ```novo
+// use xmltree
+// use xmlfind
+//
+// fn main() [io]
+//     let doc = xmltree.build("<a><t>hi</t></a>")
+//     println(xmlfind.findtext(doc, 1, "t", ""))
+// ```
+pub fn findtext(doc: xmltree.XmlDocument, from: Int, tag: Str, fallback: Str) -> Str []
+    todo("xml-nv.xmlfind.findtext")
+
+// The inner text of the first element child in this namespace with
+// this local name, or a default.
+//
+// ```novo
+// use xmltree
+// use xmlfind
+//
+// fn main() [io]
+//     let doc = xmltree.build("<a xmlns:p=\"urn:x\"><p:t>hi</p:t></a>")
+//     println(xmlfind.findtext_ns(doc, 1, "urn:x", "t", ""))
+// ```
+pub fn findtext_ns(doc: xmltree.XmlDocument, from: Int, uri: Str, local: Str,
+                   fallback: Str) -> Str []
+    todo("xml-nv.xmlfind.findtext_ns")
+
+// Every ancestor of a node, nearest first, up to and including the
+// document node.
+//
+// The `..` nobody can write as a path here.  What a caller that found
+// a node by attribute and now wants the record it belongs to needs.
+//
+// ```novo
+// use std.list
+// use xmltree
+// use xmlfind
+//
+// fn main() [io]
+//     let doc = xmltree.build("<a><b><c/></b></a>")
+//     println("${list.len(xmlfind.ancestors(doc, 3))}")
+// ```
+pub fn ancestors(doc: xmltree.XmlDocument, index: Int) -> [Int] []
+    todo("xml-nv.xmlfind.ancestors")
+
+// The nearest ancestor element with this tag, or `None`.
+//
+// ```novo
+// use xmltree
+// use xmlfind
+//
+// fn main() [io]
+//     let doc = xmltree.build("<a><b><c/></b></a>")
+//     match xmlfind.closest(doc, 3, "a")
+//         Some(i) => println(xmltree.tag_of(doc, i))
+//         None    => println("absent")
+// ```
+pub fn closest(doc: xmltree.XmlDocument, index: Int, tag: Str) -> ?Int []
+    todo("xml-nv.xmlfind.closest")
+
+// Whether an element's name matches a tag, with `XML_ANY_TAG`
+// honoured.
+//
+// The one comparison every function above makes, public so that a
+// caller writing a walk this module does not have — "every element
+// whose tag is one of these five" — makes it the same way.
+//
+// ```novo
+// use xmltree
+// use xmlfind
+//
+// fn main() [io]
+//     let doc = xmltree.build("<a/>")
+//     let any = xmlfind.matches(doc, 1, "*")
+//     println("${any}")
+// ```
+pub fn matches(doc: xmltree.XmlDocument, index: Int, tag: Str) -> Bool []
+    todo("xml-nv.xmlfind.matches")

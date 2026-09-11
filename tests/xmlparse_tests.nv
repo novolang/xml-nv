@@ -1,0 +1,244 @@
+// xmlparse_tests.nv — the API suite for the pull parser.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: xml-nv.xmlparse.<fn>`.
+//
+// THE CASES ARE THE W3C XML CONFORMANCE SUITE'S OWN SHAPE.  That suite
+// — `xmlconf`, the `valid/sa`, `not-wf/sa` and `oasis` collections — is
+// a list of documents each marked as well-formed or not, and it is the
+// oracle every XML parser is measured against.  The documents below
+// are quoted from it or reduced from it, and the whole suite becomes a
+// generated run beside this one when the implementation lands: a
+// `valid` case has to scan to `XmlEof` and a `not-wf` case has to
+// answer a fault, and nothing in between is a pass.
+//
+// WHAT IS DELIBERATELY NOT HERE: the `valid` cases whose validity
+// depends on a DTD.  This package does not read one, so a document
+// that is well-formed and invalid is, to it, a document — and the
+// suite's `invalid` collection is not an oracle for a non-validating
+// parser.  The README says the same thing in prose.
+
+use std.test
+use std.list
+use xmlparse
+use xmlerror
+
+// Every event of a document, collected, stopping at `XmlEof` or at the
+// first fault.  The shape a test wants.
+fn events(source: Str) -> [xmlparse.XmlEvent] [io]
+    var s = xmlparse.scanner(source)
+    var out = []
+    var going = true
+    while going
+        match xmlparse.next_event(s)
+            Err(_)   =>
+                going = false
+            Ok(step) =>
+                out = list.push(out, step.event)
+                s = step.scanner
+                match step.event.kind
+                    XmlEof =>
+                        going = false
+                    _      =>
+                        going = true
+    out
+
+// The fault a document stops at, or `None` when it scans to the end.
+fn fault_of(source: Str) -> ?xmlerror.XmlFaultKind [io]
+    var s = xmlparse.scanner(source)
+    var answer: ?xmlerror.XmlFaultKind = None
+    var going = true
+    while going
+        match xmlparse.next_event(s)
+            Err(f)   =>
+                answer = Some(f.kind)
+                going = false
+            Ok(step) =>
+                s = step.scanner
+                match step.event.kind
+                    XmlEof =>
+                        going = false
+                    _      =>
+                        going = true
+    answer
+
+@test
+fn test_a_well_formed_document_scans_to_eof() [io]
+    test.case("the smallest document there is")
+    let empty = events("<doc/>")
+    test.assert(list.len(empty) == 2)
+    test.assert(list.get(empty, 1).kind == XmlEof)
+
+    test.case("an element with text is three events and the end")
+    let withtext = events("<doc>hello</doc>")
+    test.assert(list.len(withtext) == 4)
+
+    test.case("an empty tag stays an empty tag — it is not a start and an end")
+    let s = xmlparse.scanner("<doc/>")
+    match xmlparse.next_event(s)
+        Err(_)   =>
+            test.assert(false)
+        Ok(step) =>
+            match step.event.kind
+                XmlEmptyTag(name, _) =>
+                    test.assert(xmlparse.text_at(step.scanner, name) == "doc")
+                _                    =>
+                    test.assert(false)
+
+@test
+fn test_every_construct_xml_1_0_allows_is_an_event() [io]
+    test.case("a comment, delimiters excluded")
+    let c = xmlparse.scanner("<!-- x --><doc/>")
+    match xmlparse.next_event(c)
+        Err(_)   =>
+            test.assert(false)
+        Ok(step) =>
+            match step.event.kind
+                XmlComment(text) =>
+                    test.assert(xmlparse.text_at(step.scanner, text) == " x ")
+                _                =>
+                    test.assert(false)
+
+    test.case("a processing instruction splits target from data")
+    let p = xmlparse.scanner("<?php echo 1; ?><doc/>")
+    match xmlparse.next_event(p)
+        Err(_)   =>
+            test.assert(false)
+        Ok(step) =>
+            match step.event.kind
+                XmlProcessingInstruction(target, _) =>
+                    test.assert(xmlparse.text_at(step.scanner, target) == "php")
+                _                                   =>
+                    test.assert(false)
+
+    test.case("a CDATA section is its own event — xmlconf valid/sa/114")
+    let cd = events("<doc><![CDATA[<greeting>]]></doc>")
+    test.assert(list.len(cd) == 4)
+
+    test.case("a doctype comes back whole and unparsed")
+    let d = xmlparse.scanner("<!DOCTYPE doc [<!ELEMENT doc (#PCDATA)>]><doc/>")
+    match xmlparse.next_event(d)
+        Err(_)   =>
+            test.assert(false)
+        Ok(step) =>
+            match step.event.kind
+                XmlDoctype(_) => test.assert(true)
+                _             => test.assert(false)
+
+@test
+fn test_the_five_predefined_entities_and_the_numeric_references() [io]
+    test.case("all five, and nothing else, have a value")
+    test.assert(xmlparse.entity_value("lt") == Some(60))
+    test.assert(xmlparse.entity_value("gt") == Some(62))
+    test.assert(xmlparse.entity_value("amp") == Some(38))
+    test.assert(xmlparse.entity_value("apos") == Some(39))
+    test.assert(xmlparse.entity_value("quot") == Some(34))
+    test.assert(xmlparse.entity_value("nbsp") == None)
+
+    test.case("text holding an entity is flagged rather than decoded")
+    let s = xmlparse.scanner("<doc>a&amp;b</doc>")
+    match xmlparse.next_event(s)
+        Err(_)    =>
+            test.assert(false)
+        Ok(first) =>
+            match xmlparse.next_event(first.scanner)
+                Err(_)     =>
+                    test.assert(false)
+                Ok(second) =>
+                    match second.event.kind
+                        XmlText(_, needs) => test.assert(needs)
+                        _                 => test.assert(false)
+
+    test.case("decode expands the five and both numeric forms")
+    let t = xmlparse.scanner("<doc>&#65;&#x42;</doc>")
+    match xmlparse.decode(t, XmlRange { start: 5, end: 16 })
+        Ok(text) => test.assert(text == "AB")
+        Err(_)   => test.assert(false)
+
+    test.case("a code point outside the Char production is a fault")
+    test.assert(xmlparse.is_xml_char(9))
+    test.assert(xmlparse.is_xml_char(0) == false)
+    test.assert(xmlparse.is_xml_char(55296) == false)
+
+@test
+fn test_the_not_wf_cases_answer_the_fault_the_suite_expects() [io]
+    test.case("an end tag that does not match — xmlconf not-wf/sa/012")
+    test.assert(fault_of("<doc></dOc>") == Some(XmlMismatchedEnd))
+
+    test.case("an end tag with nothing open")
+    test.assert(fault_of("</doc>") == Some(XmlStrayEnd))
+
+    test.case("an undefined entity — the internal subset is not read")
+    test.assert(fault_of("<doc>&mine;</doc>") == Some(XmlBadEntity))
+
+    test.case("an unquoted attribute value — xmlconf not-wf/sa/002")
+    test.assert(fault_of("<doc a=1/>") == Some(XmlUnquotedAttribute))
+
+    test.case("the same attribute twice — XML 1.0 section 3.1")
+    test.assert(fault_of("<doc a=\"1\" a=\"2\"/>") == Some(XmlDuplicateAttribute))
+
+    test.case("-- inside a comment")
+    test.assert(fault_of("<doc><!-- a -- b --></doc>") == Some(XmlBadComment))
+
+    test.case("a numeric reference to a character XML has no name for")
+    test.assert(fault_of("<doc>&#0;</doc>") == Some(XmlBadCharRef))
+
+    test.case("two elements at the top level")
+    test.assert(fault_of("<a/><b/>") == Some(XmlMultipleRoots))
+
+    test.case("the document ends inside a tag")
+    test.assert(fault_of("<doc") == Some(XmlUnexpectedEnd))
+
+    test.case("an encoding this package cannot read is refused, not guessed")
+    let latin = "<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><doc/>"
+    test.assert(fault_of(latin) == Some(XmlUnsupportedEncoding))
+
+@test
+fn test_the_scanner_carries_position_and_depth() [io]
+    test.case("depth is the number of open elements")
+    let s = xmlparse.scanner("<a><b/></a>")
+    test.assert(xmlparse.depth(s) == 0)
+
+    test.case("a fault knows where it was")
+    match xmlparse.next_event(xmlparse.scanner("</doc>"))
+        Err(f) => test.assert(f.at >= 0)
+        Ok(_)  => test.assert(false)
+
+    test.case("line and column are 1-based")
+    let p = xmlparse.scanner("<doc>hi</doc>")
+    test.assert(xmlparse.line_of(p, 0) == 1)
+    test.assert(xmlparse.column_of(p, 0) == 1)
+
+@test
+fn test_a_name_is_checked_against_the_production() [io]
+    test.case("what XML 1.0 calls a Name")
+    test.assert(xmlparse.is_name("doc"))
+    test.assert(xmlparse.is_name("_x"))
+    test.assert(xmlparse.is_name("ns:local"))
+    test.assert(xmlparse.is_name("a.b-c"))
+
+    test.case("and what it does not")
+    test.assert(xmlparse.is_name("1a") == false)
+    test.assert(xmlparse.is_name("-a") == false)
+    test.assert(xmlparse.is_name("a b") == false)
+    test.assert(xmlparse.is_name("") == false)
+
+@test
+fn test_the_fault_vocabulary_is_stable() [io]
+    test.case("a kind has a name a message and a test can quote")
+    test.assert(xmlerror.kind_name(XmlBadEntity) == "bad-entity")
+    test.assert(xmlerror.kind_name(XmlMismatchedEnd) == "mismatched-end")
+
+    test.case("exactly four faults are the ones a tolerant build recovers from")
+    test.assert(xmlerror.is_recoverable(XmlMismatchedEnd))
+    test.assert(xmlerror.is_recoverable(XmlStrayEnd))
+    test.assert(xmlerror.is_recoverable(XmlUnexpectedEnd))
+    test.assert(xmlerror.is_recoverable(XmlUndeclaredPrefix))
+    test.assert(xmlerror.is_recoverable(XmlBadEntity) == false)
+    test.assert(xmlerror.is_recoverable(XmlUnquotedAttribute) == false)
+
+    test.case("a fault carries an offset and a message, not a rendered source")
+    let f = xmlerror.fault(XmlStrayEnd, 12, 18)
+    test.assert(f.at == 12)
+    test.assert(f.to == 18)
+    test.assert(xmlerror.message(f) != "")
