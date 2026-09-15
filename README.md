@@ -1,240 +1,282 @@
 # xml-nv
 
-**Status: NOT IMPLEMENTED — interface only.**
+XML is a markup language for documents and data, defined by
+[XML 1.0](https://www.w3.org/TR/xml/) and, for names carrying a prefix,
+by [XML Namespaces 1.0](https://www.w3.org/TR/xml-names/). This package
+reads and writes it in novo-lang, with no dependencies and no document
+type definition: a pull parser whose events are byte ranges into the
+caller's own string, a tree built from those events, named walks over
+that tree, and a writer.
 
-Every public function below is published with its signature and its
-effect row, and every body is `todo()`.  Installing this package works;
-calling it panics with `not implemented`.
+**Status: NOT IMPLEMENTED — interface only.** Every function is
+declared with its full signature, but every body is a `todo()` that
+panics when called. The package is published so its design can be
+reviewed and depended on before it is implemented. Version 0.1.0 will
+be the first working release.
 
-## What this is
+## What it is
 
-XML 1.0, read without reading a DTD.  A pull parser whose events are
-byte ranges into the string the caller still holds, a tree built from
-those same events, and a writer that puts a tree back out.  It is what
-you reach for when something hands you a feed, a SOAP envelope, an
-`.xlsx` part, an Android layout or a twenty-year-old configuration
-file, and you would rather not install a C library to read it.
+An XML document is one **root element** with markup and text inside it.
+An **element** is a start tag, its content and an end tag, or an empty
+tag that is both at once. A tag carries **attributes**, each a name and
+a quoted value.
 
-Five modules, and a reader should know which one they are on.
+A **pull parser** answers one **event** at a time: the caller asks for
+the next one and decides what to do with it. This package's events are
+XML 1.0's own list of what a document can contain.
 
-| surface | module | reach for it when |
-| --- | --- | --- |
-| the **events** | `xmlparse` | the document is large, or you want one element out of it |
-| the **tree** | `xmltree` | the document fits in memory and you will ask it several questions |
-| the **finds** | `xmlfind` | you know the tag or the attribute you are after |
-| the **writer** | `xmlwrite` | you are producing XML, or changing part of a document |
-| the **faults** | `xmlerror` | you are reporting what was wrong with somebody's file |
+| Event | The construct |
+| --- | --- |
+| `XmlStartTag` | `<tag a="1">`, with the attributes in source order |
+| `XmlEndTag` | `</tag>` |
+| `XmlEmptyTag` | `<tag a="1"/>`, kept as one event so a rewriter can put it back |
+| `XmlText` | A run of character data between markup |
+| `XmlCData` | `<![CDATA[...]]>`, never decoded, which is what the section is for |
+| `XmlComment` | `<!-- ... -->` |
+| `XmlProcessingInstruction` | `<?target data?>` |
+| `XmlDeclaration` | `<?xml version="1.0" encoding="UTF-8"?>` |
+| `XmlDoctype` | `<!DOCTYPE ...>`, whole and unparsed |
+| `XmlEof` | The document ended |
 
-## Adding it, and checking it
+Every event is a **range**: a pair of byte offsets into the string the
+caller still holds. Nothing is copied. `&amp;` is not a substring of the
+document, so decoding is a separate call a caller makes when it wants
+the text and skips when it only wants to know an element was there.
 
-```bash
-novo pkg add xml-nv           # into your novo.toml
-novo pkg build                # type- and effect-check the package
-novo test --isolate tests/xmlparse_tests.nv
+A **document type definition**, or DTD, is a schema language XML carries
+inside the document or references outside it. This package does not read
+one. The five predefined entities and the numeric character references
+are expanded, and nothing else is.
+
+A **namespace** is a URI that qualifies a name. It is bound to a
+**prefix** by an `xmlns:` attribute, scoped to the element the attribute
+is written on. The scanner hands over names as they are written and the
+tree resolves them, because resolving a prefix needs the stack of open
+elements.
+
+| Quantity | Default |
+| --- | --- |
+| Deepest nesting | 256 elements |
+| Most attributes on one element | 4096 |
+| Longest single name | 1024 bytes |
+| Predefined entities | 5 |
+
+## Install
+
+```
+novo pkg add xml-nv
 ```
 
-`novo test` is red today and that is the point of the release: every
-assertion fails with `not implemented: xml-nv.<module>.<fn>`.  They turn
-green one at a time as bodies land.
-
-## The one example that will work
+## Example
 
 ```novo
 use xmltree
 use xmlfind
 
 fn main() [io]
+    // Build a tree. Nothing is opened: the caller holds the text.
     let doc = xmltree.build("<feed><item><title>hello</title></item></feed>")
-    for item in xmlfind.findall_descendants(doc, 1, "item")
+
+    // Every `item` anywhere below the root, then the text of the
+    // `title` inside each one, with a fallback when there is none.
+    for item in xmlfind.findall_descendants(doc, xmltree.root(doc), "item")
         println(xmlfind.findtext(doc, item, "title", "(untitled)"))
-    // hello
+
+    // A tolerant build records what it had to repair rather than
+    // refusing. An empty list means the document was well-formed.
+    for issue in xmltree.issues_of(doc)
+        println(xmltree.issue_text(doc, issue))
 ```
 
-## The load-bearing interface
+It prints `hello`.
 
-`xmlparse.next_event` — a scanner value in, an event and the next
-scanner out.
+Build and test with `novo pkg build` and `novo test`. Today `novo test`
+fails on purpose: every test reaches a `not implemented:
+xml-nv.<module>.<fn>` panic. The tests are the specification the
+implementation will have to satisfy.
 
-```novo norun:pseudo
-pub fn next_event(s: XmlScanner) -> Result<XmlStep, xmlerror.XmlFault> []
-```
+## What the package contains
 
-Everything else in the package is built on it.  `xmltree.build` is that
-loop with an arena under it.  `xmlwrite` is its inverse.  `xmlfind` is
-arithmetic over what the arena holds.  And a caller streaming a 400 MB
-export calls it and nothing else, because the state is three integers
-and a stack of open-element ranges, and no event allocates.
-
-The second decision the rest follows from is that **every event is a
-byte range, never a copy**.  A start tag says where its name is and
-where each attribute's name and value are.  `&amp;` is not a substring
-of the document, so decoding is a separate call that a caller makes when
-it wants the text and skips when it only wants to know an element was
-seen — which, for a scan looking for one tag in a large file, is always.
-
-## Where the tolerance is, and where it is not
-
-The package's row on the grid asks for "a pull parser and a tolerant
-tree", and the two halves differ on purpose.
-
-**The scanner is draconian**, because XML 1.0 § 1.2 says a
-well-formedness error is fatal and a conforming processor must not
-continue past one.  `next_event` answers `Err` and the scan is over.
-That is not this package being strict; it is the difference between XML
-and HTML, and it is why html-nv — otherwise this package's twin — has no
-error type at all.
-
-**`xmltree.build` is tolerant of four named things**, and of nothing
-else:
-
-| what | what happens |
+| Module | Contents |
 | --- | --- |
-| an end tag that matches no open element | closes up to the nearest ancestor that does, or is dropped |
-| an end tag with nothing open | dropped |
-| the document ending mid-element | everything still open is closed at the end of the source |
-| an undeclared namespace prefix | the name keeps its prefix and resolves to no namespace |
+| `xmlparse` | The scanner: the events, the ranges, the limits, the decoder, and the line and column of an offset. |
+| `xmltree` | The tree: the nodes as an arena of indices, the namespaces resolved, the attributes, the text, and the repairs a tolerant build recorded. |
+| `xmlfind` | Named walks over a tree: by tag, by namespace and local name, by attribute, over children or over descendants, and upwards to an ancestor. |
+| `xmlwrite` | Writing: a whole document or one node into a caller's buffer, three option sets, and each construct on its own. |
+| `xmlerror` | Every way a document is not well-formed, each with the byte range, and which of them a tolerant build can repair. |
 
-Each one records an `XmlIssue` on the document, so a caller that wanted
-strictness can ask for `doc.issues` to be empty — or call
-`xmltree.build_strict`, which is XML 1.0's own behaviour and the right
-choice for a validator or a signature check.
+## How to choose an entry point
 
-Everything else stops the build: a malformed entity, an unquoted
-attribute, a bad declaration.  After one of those the scanner cannot say
-what the next event even is, and a tree built past it would be a guess
-dressed as a document.  `xmlerror.is_recoverable` is that rule as a
-function, public because it decides which half of this package a caller
-is in.
+**`xmlparse.next_event` is the scanner.** A scanner value in, an event
+and the next scanner out. Use it when the document is large, or when
+you want one element out of it. The state is three integers and a stack
+of open names, and no event allocates.
 
-## What is outside XML 1.0 here
+**`xmltree.build` gives you the whole document.** Use it when the
+document fits in memory and you will ask it several questions.
+`build_strict` is the same thing that refuses rather than repairs.
 
-Named, because a parser that half-implements a specification is worse
-than one that says where it stops.
+**`xmlfind` is how a tree is searched.** Each function is a named walk,
+so the signature says what it does.
 
-**The DTD, past the five predefined entities.**  `&lt;` `&gt;` `&amp;`
-`&apos;` `&quot;` and the numeric references `&#nn;` / `&#xNN;` are
-expanded.  Nothing else is: a document that declares `<!ENTITY mine
-"...">` in an internal subset and then writes `&mine;` gets
-`XmlBadEntity`.  The `<!DOCTYPE ...>` itself is not refused — it arrives
-as one `XmlDoctype` event carrying the whole declaration, internal
-subset included, unparsed — so a caller that needs the subset has the
-bytes and can read them itself.
+**`xmlwrite.serialize` puts a tree back out**, and the `write_*`
+functions write one construct at a time for a caller producing XML
+without a tree.
 
-One consequence worth having on purpose: **there is no billion-laughs
-attack surface**, because there is no entity expansion to recurse.  The
-`XmlLimits` bounds are about nesting and attribute counts, not about
-expansion depth.
+## The rules a user needs
 
-**Validation.**  No DTD validation, no XML Schema, no RelaxNG.  A
-document is well-formed or it is not, and whether it matches a schema is
-schema-nv's question about a different tree or somebody else's package
-about this one.
+1. **The scanner stops at the first fault, and the scan is over.** XML
+   1.0 section 1.2 makes a well-formedness error fatal and forbids a
+   conforming processor from continuing past one. That is the
+   difference between XML and HTML.
+2. **`xmltree.build` repairs four things and nothing else.**
 
-**The external subset, and every other thing that would be fetched.**  A
-`SYSTEM` identifier is bytes in the doctype event and nothing follows
-it.  This is a `core` package: it has no `[net]` and no `[fs]` to follow
-one with, which makes XXE not a vulnerability that was mitigated but a
-capability that does not exist.
+   | What | What happens |
+   | --- | --- |
+   | An end tag matching no open element | Closes up to the nearest ancestor that matches, or is dropped |
+   | An end tag with nothing open | Dropped |
+   | The document ending mid-element | Everything still open closes at the end of the source |
+   | An undeclared namespace prefix | The name keeps its prefix and resolves to no namespace |
 
-**Encodings other than UTF-8.**  novo-lang's `Str` is UTF-8, so the
-scanner reads UTF-8, and `<?xml encoding="ISO-8859-1"?>` is
-`XmlUnsupportedEncoding` rather than a transcode — a `core` package has
-no encoding tables, and answering Latin-1 bytes as though they were
-UTF-8 would corrupt text silently instead of refusing loudly.  A caller
-holding other bytes decodes them first.
+   Each repair records an `XmlIssue` on the document.
+   `xmltree.issues_of` lists them, so a caller wanting strictness can
+   require the list to be empty. `xmlerror.is_recoverable` is the same
+   rule as a function.
+3. **Anything else stops the build.** After a malformed entity, an
+   unquoted attribute or a bad declaration the scanner cannot say what
+   the next event is, and a tree built past one would be a guess.
+4. **An event is a range, not a string.** `xmlparse.text_at` answers
+   the bytes and `xmlparse.decode` answers them with the entities
+   expanded. A scan looking for one tag in a large file calls neither.
+5. **Only the five predefined entities and numeric references are
+   expanded.** `&lt;`, `&gt;`, `&amp;`, `&apos;`, `&quot;`, `&#nn;` and
+   `&#xNN;`. A document that declares `<!ENTITY mine "...">` and writes
+   `&mine;` answers `XmlBadEntity`.
+6. **There is no entity expansion, so there is no billion-laughs
+   attack.** The limits bound nesting, attribute count and name length,
+   because those are the pathological inputs that remain.
+7. **The doctype arrives whole and unparsed.** The event's range covers
+   `<!` to the matching `>`, internal subset included. A caller that
+   needs the subset has the bytes.
+8. **Nothing outside the document is ever fetched.** A `SYSTEM`
+   identifier is bytes in the doctype event and nothing follows it.
+   This package declares no effects at all, so an XML external entity
+   attack is not a risk that was mitigated: it is a capability that
+   does not exist.
+9. **Text is UTF-8.** novo-lang's `Str` is UTF-8, so
+   `<?xml encoding="ISO-8859-1"?>` answers `XmlUnsupportedEncoding`
+   rather than being transcoded. A caller holding other bytes decodes
+   them first.
+10. **Whitespace inside an element is content.** Without a schema there
+    is nothing that could say otherwise, and `xml:space` and
+    `xml:lang` are ordinary attributes here.
+11. **Namespace matching is on the local name and the URI, never on
+    the prefix.** A prefix is a spelling the document chose, and two
+    feeds in one namespace may spell it `atom:` and `a:`. That is what
+    every `_ns` function does; the plain functions match the qualified
+    name as written, which is what a document with no namespaces
+    wants.
+12. **An unprefixed attribute is in no namespace.** Never in the
+    default one. XML Namespaces 1.0 section 6.2.
+    `<a xmlns="urn:x" id="1">` has an element in `urn:x` and an
+    attribute in nothing.
+13. **`xmlns` attributes stay in the attribute list.** A rewriter that
+    dropped them would write a document whose prefixes no longer bind.
+    `xmltree.is_namespace_decl` is how a walk over the attributes skips
+    them.
+14. **An empty tag stays one event.** Collapsing `<tag/>` into a start
+    and an end would lose the one thing a rewriter needs to reproduce
+    the source.
+15. **The same attribute name twice on one element is refused.** XML
+    1.0 section 3.1 forbids it outright.
+16. **A document has exactly one root**, and content after it that is
+    not a comment, a processing instruction or whitespace is
+    `XmlTrailingContent`.
+17. **A fault carries byte offsets, and lines are computed on demand.**
+    `XmlFault.at` and `.to` are offsets into the source.
+    `xmlparse.line_of` and `column_of` turn one into a place a person
+    can go to.
+18. **`xmlerror.kind_name` is stable across releases.** Programs quote
+    the spellings in their own messages and tests.
 
-**XInclude, XPointer, XPath, XSLT, canonical XML.**  None of them.
-`xmlfind` is deliberately not an XPath subset — see below.
+## What is not included
 
-**`xml:space` and `xml:lang`.**  Not interpreted.  They are ordinary
-attributes here; whitespace inside an element is content, because
-without a schema there is nothing that could say otherwise.
+- **Reading a DTD, past the five predefined entities.** See rule 5.
+- **Validation of any kind.** No DTD validity, no XML Schema, no
+  RelaxNG. A document is well-formed or it is not.
+- **Fetching the external subset, or anything else.** See rule 8.
+- **Encodings other than UTF-8.** See rule 9.
+- **XPath, XPointer, XInclude, XSLT and canonical XML.** `xmlfind` is
+  deliberately not a path language. ElementTree's limited XPath subset
+  has `//`, `[@attr='v']` and `[position()]` and silently lacks axes,
+  functions and unions, so a caller who knows XPath writes an
+  expression that parses and answers the wrong nodes. Every function
+  here is a named walk instead, and a caller who wants a path language
+  wants a package that says XPath on the tin.
+- **A microcontroller build.** The tree is an allocation per document
+  and the scanner speaks `Str`.
+  [cbor-nv](https://novo-lang.org/packages/cbor-nv) is the format
+  package on the registry with a half that compiles for a device.
 
-## Why `xmlfind` is not an XPath subset
+## Related packages
 
-ElementTree ships a "limited XPath subset", and the limits are the
-problem.  It has `//`, `[@attr='v']`, `[position()]` and `..`; it
-silently does not have axes, functions, unions, or anything else.  So a
-caller who knows XPath writes an expression that *parses* and answers
-the wrong nodes, and finds out in production.
+- [html-nv](https://novo-lang.org/packages/html-nv) is HTML5, and the
+  two are siblings rather than one built on the other. HTML5's
+  tokenizer has eighty states and 2231 named character references and
+  recovers from everything; XML's has neither and recovers from
+  nothing. A shared markup scanner would be two state machines behind
+  one name.
+- `rss-nv` is RSS and Atom over these events, and it is why
+  `xmlfind`'s namespace-aware half exists: an Atom feed puts everything
+  in `http://www.w3.org/2005/Atom` and every publisher spells the
+  prefix differently.
+- [schema-nv](https://novo-lang.org/packages/schema-nv) validates a
+  JSON document rather than an XML one. Whether an XML document matches
+  a schema is not a question this package answers.
+- [cbor-nv](https://novo-lang.org/packages/cbor-nv) and
+  [yaml-nv](https://novo-lang.org/packages/yaml-nv) are the other
+  document formats on the registry.
+- libxml2 is not the reference and is not on the bindings shelf. This
+  is a native port: it builds for wasm, and a consumer who takes it
+  does not take a C toolchain.
 
-Every function here is a named walk instead — `find`, `findall`,
-`find_descendant`, `findall_by_attr`, `ancestors`, `closest` — so the
-signature says what it does and a reader can see that this is not a path
-language.  A caller who genuinely wants one over a tree wants a package
-that says XPath on the tin.
+## Tests
 
-The other thing made explicit rather than implied: **matching is on the
-local name and the namespace, never on the prefix**, in every `_ns`
-function.  A prefix is a spelling the document chose, and two feeds in
-one namespace may spell it `atom:` and `a:`.  The plain functions match
-the qualified name as written, which is what a caller with a
-namespace-free document wants and what keeps the common case to one
-argument.
+```bash
+novo test --isolate tests/xmlparse_tests.nv   #  7 tests: the events and the refusals
+novo test --isolate tests/xmltree_tests.nv    # 10 tests: the tree, the namespaces, the repairs
+```
 
-## Namespaces are resolved on the tree, not on the events
-
-An `xmlns:` declaration is scoped to the element it is written on, so
-resolving a prefix needs the stack of open elements — state a pull
-parser would have to carry for every caller, including everyone scanning
-a document with no namespaces in it.  So `xmlparse` hands over qualified
-names as written and `xmltree` splits them once, into an index into
-`doc.namespaces`.
-
-Two details that follow, and that libraries get wrong:
-
-- **An unprefixed attribute is in no namespace**, never in the default
-  one (XML Namespaces 1.0 § 6.2).  `<a xmlns="urn:x" id="1">` has an
-  element in `urn:x` and an attribute in nothing.
-- **`xmlns` attributes stay in the attribute list.**  A rewriter that
-  dropped them would write a document whose prefixes no longer bind.
-  `xmltree.is_namespace_decl` is how a caller walking attributes skips
-  them.
-
-## The layer, and why
-
-`core`.  A scan over a string the caller already holds, an arena of
-indices, and a serialiser that appends to the caller's buffer.  No
-function declares an effect, and the two places one could have crept in
-are refusals rather than omissions: an external DTD subset is never
-fetched, and a non-UTF-8 encoding declaration is answered rather than
-transcoded.
-
-**No device claim.**  There is no `tests/embedded_probe.nv`, and that is
-a claim not made rather than a claim skipped: the tree is an allocation
-per document and the scanner speaks `Str`.  cbor-nv is the format
-package on this grid with a half that compiles for a microcontroller,
-and it says so.
-
-## The reference implementation
-
-`quick-xml` (Rust, MIT) for the event half — its `Event` enum is the
-shape `XmlEventKind` has, minus the borrowed-vs-owned distinction that
-novo-lang's ranges make unnecessary — and Python's
-`xml.etree.ElementTree` (PSF) for the tree and the finds.  The oracle is
-the **W3C XML Conformance Test Suite**: its `valid` documents must scan
-to `XmlEof`, its `not-wf` documents must answer a fault, and
+`quick-xml` in Rust is the reference for the event half, and Python's
+`xml.etree.ElementTree` for the tree and the finds. The oracle is the
+W3C XML Conformance Test Suite: its `valid` documents must scan to
+`XmlEof` and its `not-wf` documents must answer a fault.
 `tests/xmlparse_tests.nv` quotes the cases a reader can check against
-the suite rather than against this package.  The `invalid` collection is
-deliberately not an oracle here — it is about DTD validity, which this
-package does not claim.
+that suite rather than against this package. The suite's `invalid`
+collection is about DTD validity, which this package does not claim,
+and is not an oracle here.
 
-libxml2 is **not** on [the bindings shelf](https://novo-lang.org/docs/orbit-map.html)
-and is not the reference: this is a native port, it builds for wasm, and
-a consumer who takes it does not take a C toolchain.
+The suite asserts that an empty tag is one event, that a mismatched end
+tag is fatal to the scanner and an issue to the tree, that a CDATA
+section is not decoded, that an unprefixed attribute is in no
+namespace, that an `xmlns` attribute stays in the attribute list, that
+an undeclared prefix resolves to no namespace with an issue recorded,
+that a non-UTF-8 encoding declaration is refused, and that a document
+with two roots is refused.
 
-## What depends on this
+The tests compile today and fail at run, each on the `not implemented`
+panic that is its body. That is the expected state of an interface
+release. They turn green one at a time as bodies land.
 
-`rss-nv` — RSS and Atom, read and written over these events — is the
-first consumer on the grid, and it is the reason `xmlfind`'s
-namespace-aware half exists: an Atom feed puts everything in
-`http://www.w3.org/2005/Atom` and every publisher spells the prefix
-differently.
+## Implementation status
 
-## Status
+Nothing is implemented, apart from the four constants. Every function
+here is declared with its signature and its effect row, and every body
+is a `todo()`.
 
-| function | implemented |
+| Item | Implemented |
 | --- | --- |
+| `xmlparse.PREDEFINED_ENTITIES`, `xmltree.XML_NO_NODE`, `.XML_NO_NAMESPACE`, `xmlfind.XML_ANY_TAG` | yes (they are constants) |
 | `xmlerror.fault`, `.kind_name`, `.message`, `.is_recoverable` | no |
 | `xmlparse.default_limits`, `.scanner`, `.scanner_with` | no |
 | `xmlparse.next_event`, `.depth` | no |
@@ -258,3 +300,9 @@ differently.
 | `xmlwrite.write_text`, `.write_attr_value`, `.write_cdata` | no |
 | `xmlwrite.write_comment`, `.write_pi`, `.write_declaration` | no |
 | `xmlwrite.escape_overhead` | no |
+
+## Licence
+
+Apache-2.0. See `LICENSE`.
+
+<!-- docs/writing-a-readme.md is the style guide for this page. -->

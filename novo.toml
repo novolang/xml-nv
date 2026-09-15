@@ -1,6 +1,6 @@
 [package]
 name        = "xml-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "XML 1.0 without a DTD: a pull parser whose events are byte ranges into the caller's own string, a tolerant tree built from those same events with namespace prefixes already resolved, ElementTree's find and findall as named walks rather than an XPath subset, and a writer that escapes into a caller's buffer and refuses to emit what it cannot escape.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
