@@ -120,6 +120,17 @@ pub struct XmlFault
     // knew where it started and not how far it ran.
     to: Int
 
+// `XmlFault` is an `Error`, which is what lets `Result<T, XmlFault>`
+// exist at all — every fallible signature in `xmlparse` and
+// `xmlwrite` answers with one.
+impl Error for XmlFault
+    // The one-line message: `xmlerror.message`'s sentence, the kind's
+    // name with the offset it happened at.
+    //
+    // Panics with `not implemented` until the bodies land.
+    fn message(self) -> Str
+        todo("xml-nv.XmlFault.message")
+
 // A fault from its parts.
 //
 // ```novo
