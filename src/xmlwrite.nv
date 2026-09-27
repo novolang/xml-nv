@@ -20,6 +20,7 @@
 // values it is written as U+FFFD, and a comment, CDATA section or
 // processing instruction holding one is refused.
 
+use std.bytes
 use xmlerror
 use xmlparse
 use xmltree
@@ -97,10 +98,9 @@ pub fn preserve() -> XmlWriteOptions []
         quote: 34,
         preserve_shape: true }
 
-// Append a string's bytes to the buffer, with no intermediate copy.
+// Append a string's bytes to the buffer.
 fn put(var out: [u8], text: Str) -> [u8]
-    for i in 0..str.len(text)
-        list.push(out, str.byte_at_or(text, i, 0) as u8)
+    list.append(out, bytes.to_byte_list(bytes.from_str(text)))
     out
 
 // The byte at `i`, or -1.
