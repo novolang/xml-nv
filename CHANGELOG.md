@@ -4,6 +4,61 @@ Every published version, newest first. This file is on the publish
 allow-list, so it travels with the package: it is the only thing a
 consumer deciding whether to upgrade can read.
 
+## 0.1.0 — 2026-09-27
+
+The first implementation of the interface published as 0.0.1: the
+pull parser, the tolerant tree with namespaces resolved, the finds, and
+the writer.
+
+### Added
+
+- `xmlparse.next_event` checks every well-formedness constraint of XML
+  1.0 that does not need a DTD: the Name and Char productions, the
+  declaration's pseudo-attributes and their order, references, comments,
+  CDATA sections, processing instructions, one root, and the limits.
+  A document type declaration is skipped to its matching `>`, internal
+  subset included.
+- `xmlparse.decode_attr` answers an attribute value normalised as XML
+  1.0 section 3.3.3 says; `decode` answers text with line ends
+  normalised as section 2.11 says.
+- `xmltree` resolves prefixes with XML Namespaces 1.0's scoping, binds
+  `xml` without a declaration, refuses the reserved bindings, and
+  records the four repairs as issues.
+- `xmltree.XML_XML_NAMESPACE` is the namespace index of the `xml`
+  prefix, which has no entry in `XmlDocument.namespaces`.
+- `xmlwrite` writes the canonical, pretty and preserving forms;
+  `preserve()` writes a well-formed document back byte for byte.
+- `XmlFaultKind.XmlBadChar`, for a character outside the Char
+  production written directly, or bytes that are not UTF-8.
+- `tests/conformance_tests.nv`, written by `tools/conformance.py` from
+  the W3C XML Conformance Test Suite's `xmltest` collection, with
+  Python's expat checking every verdict.
+
+### Changed
+
+These break code written against 0.0.x.
+
+- Every `xmlwrite` function takes its buffer as `var out: [u8]`.  A
+  list is a reference type (SPEC section 4.1), and a buffer passed as a
+  plain parameter cannot be written.  A caller passing `[]` or a `var`
+  name compiles as before; one passing a `let` name declares it `var`.
+- `XmlScanner` has a sixth field, `doctype_seen`, so that a second
+  document type declaration is refused.
+- `XmlFaultKind` has a twentieth arm, `XmlBadChar`; a `match` over it
+  that names every arm needs one more.
+- The document ending inside a CDATA section or a processing
+  instruction is `XmlUnexpectedEnd`, as it is inside any other
+  construct.  `XmlTrailingContent` covers content before the root
+  element as well as after it, and `XmlBadDeclaration` covers a
+  document type declaration after the root or after another one.
+- `xmltree` records an end tag that matches no open element as
+  `XmlStrayEnd` even when elements are open, because it drops that tag;
+  `XmlMismatchedEnd` is kept for one that closes an ancestor.
+- `XmlText.needs_decoding` is also set for a carriage return, and
+  `XmlAttr.needs_decoding` for a literal tab, line feed or carriage
+  return, because the decoded text differs from the bytes there.
+- `xmlerror.message` answers `<kind-name> at byte <offset>`.
+
 ## 0.0.2 — 2026-09-15
 
 README rewritten to the package README style guide (docs/writing-a-readme.md).

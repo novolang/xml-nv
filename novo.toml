@@ -1,28 +1,23 @@
 [package]
 name        = "xml-nv"
-version     = "0.0.2"
-description = "XML 1.0 without a DTD: a pull parser whose events are byte ranges into the caller's own string, a tolerant tree built from those same events with namespace prefixes already resolved, ElementTree's find and findall as named walks rather than an XPath subset, and a writer that escapes into a caller's buffer and refuses to emit what it cannot escape.  Interface only — every body is a todo()."
+version     = "0.1.0"
+description = "XML 1.0 without a DTD: a pull parser whose events are byte ranges into the caller's own string, a tolerant tree built from those same events with namespace prefixes already resolved, ElementTree's find and findall as named walks rather than an XPath subset, and a writer that escapes into a caller's buffer and refuses to emit what it cannot escape."
 license     = "Apache-2.0"
 
-# An INTERFACE release: every `pub fn` body is a `todo()`, so the
-# signatures and the effect rows are published and nothing is
-# implemented.  `novo pkg publish` recognises the shape and requires
-# both the draft stability and the 0.0.x version; the first
-# implementation is the 0.1.0 published over it.
-stability   = "draft"
+# `experimental` because no program outside this repository has used the
+# package yet, and the tests were written against the signatures rather
+# than by a consumer.
+stability   = "experimental"
 
 # `core`: a scan over a string the caller already holds, an arena of
-# indices, and a serialiser that appends to the caller's buffer.  No
-# function declares an effect, and the two places one could have crept
-# in are named rather than left to be discovered — a DTD's external
-# subset is never fetched and an `<?xml encoding=?>` other than UTF-8
-# is refused rather than transcoded, so nothing here reads anything.
+# indices, and a writer that appends to the caller's buffer.  No
+# function declares an effect.  A DTD's external subset is never
+# fetched, and an `<?xml encoding=?>` other than UTF-8 is refused rather
+# than transcoded, so nothing here reads anything.
 #
-# NO `tests/embedded_probe.nv`, and the absence is a claim not made
-# rather than a claim skipped.  The tree is one allocation per
-# document and the scanner speaks `Str`; neither is what a
-# microcontroller has.  cbor-nv is the format package on this grid that
-# carries a device half, and it says so.
+# There is no `tests/embedded_probe.nv`: the tree is an allocation per
+# document and the scanner takes a `Str`, and neither is what a
+# microcontroller has.
 layer       = "core"
 
 category    = "data"
@@ -30,7 +25,7 @@ category    = "data"
 tags        = ["xml", "parser", "pull-parser", "sax", "elementtree", "namespaces", "streaming", "sans-io"]
 repository  = "https://github.com/novolang/xml-nv"
 maintainers = ["novo-lang"]
-novo        = ">= 0.8.9"
+novo        = ">= 0.12.1"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.
@@ -39,17 +34,8 @@ novo        = ">= 0.8.9"
 "README.md" = "Reading XML without reading a DTD"
 
 [dependencies]
-# None, and the two absences worth stating.
-#
-# NOT unicode-nv.  XML 1.0's Name production is a list of code point
-# RANGES — NameStartChar and NameChar, § 2.3 — not a property lookup,
-# so `is_name` is a range check and carries its own table of twelve
-# intervals.  The Char production is five more.  Nothing here asks
-# Unicode a question about case, width or normalisation, because XML
-# name matching is defined as an exact code point comparison.
-#
-# NOT html-nv.  The two packages are siblings and neither builds on the
-# other: HTML5's tokenizer has eighty states and 2231 named character
-# references and recovers from everything, XML's has neither and
-# recovers from nothing.  A shared "markup scanner" would be two state
-# machines behind one name.
+# None.  unicode-nv is not here: XML 1.0's Name and Char productions are
+# lists of code point ranges (sections 2.2 and 2.3), and XML compares
+# names by code point, so nothing asks Unicode a question about case,
+# width or normalisation.  html-nv is not here either: HTML5's tokenizer
+# and XML's share no states worth sharing.

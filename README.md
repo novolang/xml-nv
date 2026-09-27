@@ -8,12 +8,6 @@ type definition: a pull parser whose events are byte ranges into the
 caller's own string, a tree built from those events, named walks over
 that tree, and a writer.
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is
-declared with its full signature, but every body is a `todo()` that
-panics when called. The package is published so its design can be
-reviewed and depended on before it is implemented. Version 0.1.0 will
-be the first working release.
-
 ## What it is
 
 An XML document is one **root element** with markup and text inside it.
@@ -90,16 +84,11 @@ fn main() [io]
 
 It prints `hello`.
 
-Build and test with `novo pkg build` and `novo test`. Today `novo test`
-fails on purpose: every test reaches a `not implemented:
-xml-nv.<module>.<fn>` panic. The tests are the specification the
-implementation will have to satisfy.
-
 ## What the package contains
 
 | Module | Contents |
 | --- | --- |
-| `xmlparse` | The scanner: the events, the ranges, the limits, the decoder, and the line and column of an offset. |
+| `xmlparse` | The scanner: the events, the ranges, the limits, the decoders for text and attribute values, and the line and column of an offset. |
 | `xmltree` | The tree: the nodes as an arena of indices, the namespaces resolved, the attributes, the text, and the repairs a tolerant build recorded. |
 | `xmlfind` | Named walks over a tree: by tag, by namespace and local name, by attribute, over children or over descendants, and upwards to an ancestor. |
 | `xmlwrite` | Writing: a whole document or one node into a caller's buffer, three option sets, and each construct on its own. |
@@ -109,8 +98,14 @@ implementation will have to satisfy.
 
 **`xmlparse.next_event` is the scanner.** A scanner value in, an event
 and the next scanner out. Use it when the document is large, or when
-you want one element out of it. The state is three integers and a stack
-of open names, and no event allocates.
+you want one element out of it. The state is an offset, a stack of open
+names and two flags. An event allocates its attribute list, and a start
+or end tag a new copy of the name stack, so the scanner passed in is
+never changed.
+
+**`xmltree.build_from` turns part of a scan into a tree.** A streaming
+reader scans to each `<item>` and builds a tree of that element's
+content alone.
 
 **`xmltree.build` gives you the whole document.** Use it when the
 document fits in memory and you will ask it several questions.
@@ -131,23 +126,27 @@ without a tree.
    difference between XML and HTML.
 2. **`xmltree.build` repairs four things and nothing else.**
 
-   | What | What happens |
-   | --- | --- |
-   | An end tag matching no open element | Closes up to the nearest ancestor that matches, or is dropped |
-   | An end tag with nothing open | Dropped |
-   | The document ending mid-element | Everything still open closes at the end of the source |
-   | An undeclared namespace prefix | The name keeps its prefix and resolves to no namespace |
+   | What | What happens | Recorded as |
+   | --- | --- | --- |
+   | An end tag matching an open element other than the innermost | Closes every element up to and including that one | `XmlMismatchedEnd` |
+   | An end tag matching no open element, or with nothing open | Dropped | `XmlStrayEnd` |
+   | The document ending mid-element | Everything still open closes at the end of the source | `XmlUnexpectedEnd` |
+   | An undeclared namespace prefix | The name keeps its prefix and is in no namespace | `XmlUndeclaredPrefix` |
 
    Each repair records an `XmlIssue` on the document.
    `xmltree.issues_of` lists them, so a caller wanting strictness can
-   require the list to be empty. `xmlerror.is_recoverable` is the same
+   require the list to be empty, or call `build_strict`, which answers
+   the first fault of any kind. `xmlerror.is_recoverable` is the same
    rule as a function.
 3. **Anything else stops the build.** After a malformed entity, an
    unquoted attribute or a bad declaration the scanner cannot say what
    the next event is, and a tree built past one would be a guess.
 4. **An event is a range, not a string.** `xmlparse.text_at` answers
-   the bytes and `xmlparse.decode` answers them with the entities
-   expanded. A scan looking for one tag in a large file calls neither.
+   the bytes, `xmlparse.decode` answers text with the references
+   expanded, and `xmlparse.decode_attr` answers an attribute value the
+   way XML 1.0 section 3.3.3 normalises it, each literal tab, line feed
+   and carriage return becoming a space. A scan looking for one tag in
+   a large file calls none of them.
 5. **Only the five predefined entities and numeric references are
    expanded.** `&lt;`, `&gt;`, `&amp;`, `&apos;`, `&quot;`, `&#nn;` and
    `&#xNN;`. A document that declares `<!ENTITY mine "...">` and writes
@@ -166,37 +165,43 @@ without a tree.
 9. **Text is UTF-8.** novo-lang's `Str` is UTF-8, so
    `<?xml encoding="ISO-8859-1"?>` answers `XmlUnsupportedEncoding`
    rather than being transcoded. A caller holding other bytes decodes
-   them first.
-10. **Whitespace inside an element is content.** Without a schema there
+   them first. Every character is checked against XML 1.0's Char
+   production (section 2.2), and a control character or bytes that are
+   not UTF-8 answer `XmlBadChar`.
+10. **Line ends are normalised on the way out.** A carriage return and
+    line feed, or a carriage return alone, reads as one line feed
+    (section 2.11) in every decoded text, a CDATA section included. The
+    ranges still cover the bytes as written.
+11. **Whitespace inside an element is content.** Without a schema there
     is nothing that could say otherwise, and `xml:space` and
     `xml:lang` are ordinary attributes here.
-11. **Namespace matching is on the local name and the URI, never on
+12. **Namespace matching is on the local name and the URI, never on
     the prefix.** A prefix is a spelling the document chose, and two
     feeds in one namespace may spell it `atom:` and `a:`. That is what
     every `_ns` function does; the plain functions match the qualified
     name as written, which is what a document with no namespaces
     wants.
-12. **An unprefixed attribute is in no namespace.** Never in the
+13. **An unprefixed attribute is in no namespace.** Never in the
     default one. XML Namespaces 1.0 section 6.2.
     `<a xmlns="urn:x" id="1">` has an element in `urn:x` and an
     attribute in nothing.
-13. **`xmlns` attributes stay in the attribute list.** A rewriter that
+14. **`xmlns` attributes stay in the attribute list.** A rewriter that
     dropped them would write a document whose prefixes no longer bind.
     `xmltree.is_namespace_decl` is how a walk over the attributes skips
     them.
-14. **An empty tag stays one event.** Collapsing `<tag/>` into a start
+15. **An empty tag stays one event.** Collapsing `<tag/>` into a start
     and an end would lose the one thing a rewriter needs to reproduce
     the source.
-15. **The same attribute name twice on one element is refused.** XML
+16. **The same attribute name twice on one element is refused.** XML
     1.0 section 3.1 forbids it outright.
-16. **A document has exactly one root**, and content after it that is
-    not a comment, a processing instruction or whitespace is
+17. **A document has exactly one root**, and content outside it that
+    is not a comment, a processing instruction or whitespace is
     `XmlTrailingContent`.
-17. **A fault carries byte offsets, and lines are computed on demand.**
+18. **A fault carries byte offsets, and lines are computed on demand.**
     `XmlFault.at` and `.to` are offsets into the source.
     `xmlparse.line_of` and `column_of` turn one into a place a person
     can go to.
-18. **`xmlerror.kind_name` is stable across releases.** Programs quote
+19. **`xmlerror.kind_name` is stable across releases.** Programs quote
     the spellings in their own messages and tests.
 
 ## What is not included
@@ -213,6 +218,11 @@ without a tree.
   expression that parses and answers the wrong nodes. Every function
   here is a named walk instead, and a caller who wants a path language
   wants a package that says XPath on the tin.
+- **Checking that two attributes on one element have different
+  expanded names.** XML Namespaces 1.0 section 6.3 forbids
+  `<a p:x="1" q:x="2">` when `p` and `q` are bound to one URI. The
+  scanner refuses two attributes with the same qualified name, and the
+  tree does not compare expanded names.
 - **A microcontroller build.** The tree is an allocation per document
   and the scanner speaks `Str`.
   [cbor-nv](https://novo-lang.org/packages/cbor-nv) is the format
@@ -243,63 +253,33 @@ without a tree.
 ## Tests
 
 ```bash
-novo test --isolate tests/xmlparse_tests.nv   #  7 tests: the events and the refusals
-novo test --isolate tests/xmltree_tests.nv    # 10 tests: the tree, the namespaces, the repairs
+novo test tests/xmlparse_tests.nv      # the events and the refusals
+novo test tests/xmlscan_tests.nv       # each construct's refusals, references, limits
+novo test tests/xmltree_tests.nv       # the tree, the finds, the writer
+novo test tests/xmlns_tests.nv         # namespaces, the repairs, building from a scan
+novo test tests/xmlwrite_tests.nv      # escaping, refusals, the three option sets
+novo test tests/conformance_tests.nv   # the W3C suite, against Python's expat
+bash tests/coverage.sh                 # line coverage over src/
 ```
 
+The oracle is the W3C XML Conformance Test Suite, xmlts20130923.
+`tools/conformance.py` writes `tests/conformance_tests.nv` from its
+`xmltest` collection: the 85 `not-wf/sa` documents with no document
+type declaration must be refused, and the 101 `valid/sa` documents
+that refer to no entity but the five predefined ones must be read.
+Python's expat must agree with the suite on every one. For each
+well-formed document the file records the text and the element count
+expat reads, which the tree must match, and the document itself, which
+`xmlwrite.preserve()` must write back byte for byte. The other 120
+documents of the two directories are left out: a not-wf one whose fault
+is inside a DTD, which this package reads as opaque bytes, and a valid
+one that uses an entity its DTD declares, which this package does not
+expand. The suite's `invalid` collection is about DTD validity and is
+not an oracle here.
+
 `quick-xml` in Rust is the reference for the event half, and Python's
-`xml.etree.ElementTree` for the tree and the finds. The oracle is the
-W3C XML Conformance Test Suite: its `valid` documents must scan to
-`XmlEof` and its `not-wf` documents must answer a fault.
-`tests/xmlparse_tests.nv` quotes the cases a reader can check against
-that suite rather than against this package. The suite's `invalid`
-collection is about DTD validity, which this package does not claim,
-and is not an oracle here.
-
-The suite asserts that an empty tag is one event, that a mismatched end
-tag is fatal to the scanner and an issue to the tree, that a CDATA
-section is not decoded, that an unprefixed attribute is in no
-namespace, that an `xmlns` attribute stays in the attribute list, that
-an undeclared prefix resolves to no namespace with an issue recorded,
-that a non-UTF-8 encoding declaration is refused, and that a document
-with two roots is refused.
-
-The tests compile today and fail at run, each on the `not implemented`
-panic that is its body. That is the expected state of an interface
-release. They turn green one at a time as bodies land.
-
-## Implementation status
-
-Nothing is implemented, apart from the four constants. Every function
-here is declared with its signature and its effect row, and every body
-is a `todo()`.
-
-| Item | Implemented |
-| --- | --- |
-| `xmlparse.PREDEFINED_ENTITIES`, `xmltree.XML_NO_NODE`, `.XML_NO_NAMESPACE`, `xmlfind.XML_ANY_TAG` | yes (they are constants) |
-| `xmlerror.fault`, `.kind_name`, `.message`, `.is_recoverable` | no |
-| `xmlparse.default_limits`, `.scanner`, `.scanner_with` | no |
-| `xmlparse.next_event`, `.depth` | no |
-| `xmlparse.text_at`, `.decode`, `.entity_value` | no |
-| `xmlparse.is_xml_char`, `.is_name`, `.line_of`, `.column_of` | no |
-| `xmltree.build`, `.build_with`, `.build_strict`, `.build_from` | no |
-| `xmltree.root`, `.document_element`, `.count`, `.node`, `.is_element` | no |
-| `xmltree.children`, `.element_children`, `.descendants` | no |
-| `xmltree.tag_of`, `.local_of`, `.namespace_of`, `.name_of` | no |
-| `xmltree.attrs_of`, `.attr`, `.attr_ns`, `.is_namespace_decl` | no |
-| `xmltree.slice`, `.text_of`, `.inner_text`, `.namespace_uri` | no |
-| `xmltree.issue_text`, `.issues_of` | no |
-| `xmlfind.find`, `.findall`, `.find_ns`, `.findall_ns` | no |
-| `xmlfind.find_descendant`, `.findall_descendants`, `.findall_descendants_ns` | no |
-| `xmlfind.find_by_attr`, `.findall_by_attr`, `.find_with_attr` | no |
-| `xmlfind.findall_descendants_by_attr` | no |
-| `xmlfind.findtext`, `.findtext_ns`, `.ancestors`, `.closest`, `.matches` | no |
-| `xmlwrite.canonical`, `.pretty`, `.preserve` | no |
-| `xmlwrite.serialize`, `.serialize_node`, `.serialize_children`, `.serialize_str` | no |
-| `xmlwrite.write_start_tag`, `.write_end_tag`, `.write_empty_tag` | no |
-| `xmlwrite.write_text`, `.write_attr_value`, `.write_cdata` | no |
-| `xmlwrite.write_comment`, `.write_pi`, `.write_declaration` | no |
-| `xmlwrite.escape_overhead` | no |
+`xml.etree.ElementTree` for the tree and the finds; the find tests are
+the ElementTree tutorial's own examples.
 
 ## Licence
 
