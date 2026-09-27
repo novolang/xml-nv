@@ -1,31 +1,24 @@
-// xmlwrite.nv — a tree, or a piece of one, back out as XML, appended
-// to a buffer the caller owns.
+// xmlwrite.nv — a tree, a piece of one, or one construct at a time,
+// appended as XML to a buffer the caller owns.
 //
-// Every body here is a `todo()`; the signatures are the design.
+// Every function takes the buffer as a `var` parameter, appends to it,
+// and answers it, so a program building a large feed keeps one buffer.
+// Nothing is written anywhere else.
 //
-// NOTHING HERE WRITES.  Every function takes the buffer to append to
-// and answers it back, so a program that is building a 40 MB feed
-// keeps one buffer and writes once, and a test asserts on bytes with
-// no file in the room.  `docs/publishing.md` § Design is explicit that
-// a library returns the text or takes the writer, and this package has
-// no effects with which to do otherwise even if it wanted to.
+// Escaping differs in three places.  In character data `&` and `<`
+// must be escaped; `>` is escaped as well, so that `]]>` cannot appear.
+// In an attribute value the quote that delimits it must be escaped, and
+// tab, line feed and carriage return are written as references because
+// a parser turns them into spaces (XML 1.0 section 3.3.3).  A comment
+// and a CDATA section have no escape at all, so `write_comment` and
+// `write_cdata` refuse text they cannot hold.
 //
-// ESCAPING IS THE WHOLE JOB, and it is different in three places.
-// `&` and `<` must be escaped in character data; `>` need not be, and
-// is anyway, because `]]>` in text is a fault and escaping the `>`
-// makes the rule unnecessary.  In an attribute value the quote that
-// delimits it must be escaped and the other need not be.  In a
-// comment, nothing may be escaped at all — a comment cannot contain
-// `--` and there is no spelling that makes it able to — so
-// `write_comment` REFUSES rather than mangles.  Those three rules are
-// why there are three escape functions and not one.
-//
-// THE WRITER CANNOT BE TALKED INTO MALFORMED OUTPUT.  Every function
-// that takes a name checks it against `xmlparse.is_name` first, and
-// every one that takes text escapes it.  A caller that concatenated a
-// tag out of user input gets a `Result` back rather than a document
-// with an injected element in it, which is the XML half of the same
-// problem html-nv's `htmlsafe` exists for.
+// Every name a caller supplies is checked with `xmlparse.is_name`, so a
+// document built from user input cannot carry an element nobody meant
+// to write.  A character XML does not allow, such as a C0 control, has
+// no spelling at all, not even as a reference: in text and attribute
+// values it is written as U+FFFD, and a comment, CDATA section or
+// processing instruction holding one is refused.
 
 use xmlerror
 use xmlparse
@@ -33,29 +26,29 @@ use xmltree
 
 // What a serialisation looks like.
 //
-// `canonical()` is the shape to use for a document a machine reads;
-// `preserve()` is the one for a document a person edits and a tool is
-// changing part of.
+// `canonical()` is the shape for a document a machine reads;
+// `preserve()` is the one for a document a person edits and a tool
+// changes part of.
 pub struct XmlWriteOptions
-    // Spaces of indentation per level of nesting.  `0` writes no
-    // whitespace at all, which is what a canonical form and a wire
-    // format both want.
+    // Spaces of indentation per level of nesting.  0 writes no
+    // whitespace that was not in the tree.  With indentation, the
+    // whitespace-only text between elements is replaced, and an
+    // element holding other text is written without indentation inside
+    // it, because that whitespace would be content.
     indent: Int
     // Write `<a/>` for an element with no children.  When false, every
     // element gets an end tag.
     self_close_empty: Bool
     // Write `<?xml version="1.0" encoding="UTF-8"?>` first.
     declaration: Bool
-    // The quote to write attribute values with: `34` for `"`, `39`
-    // for `'`.
+    // The quote attribute values are written with: 34 for `"`, 39 for
+    // `'`.  Any other value writes 34.
     quote: Int
-    // Write each element the way the source wrote it — `<a/>` where
-    // the source said `<a/>`, the source's own quote on each
-    // attribute, CDATA sections back as CDATA — rather than the way
-    // these options say.  What a tool changing one element of a
-    // person's file needs; it makes `build` then `serialize` the
-    // identity on a well-formed document, so the diff shows only what
-    // the tool changed.
+    // Write each node the way the source wrote it: its tags, its
+    // attributes, its references and its CDATA sections as they were.
+    // `build` then `serialize` is then the identity on a well-formed
+    // document.  An element whose end tag a repair supplied gets one
+    // written.  `declaration` adds one only when the source had none.
     preserve_shape: Bool
 
 // Compact, no declaration, `<a/>` for empty elements, double quotes.
@@ -67,7 +60,11 @@ pub struct XmlWriteOptions
 //     println("${xmlwrite.canonical().indent}")
 // ```
 pub fn canonical() -> XmlWriteOptions []
-    todo("xml-nv.xmlwrite.canonical")
+    XmlWriteOptions { indent: 0,
+        self_close_empty: true,
+        declaration: false,
+        quote: 34,
+        preserve_shape: false }
 
 // Two-space indentation, a declaration, `<a/>` for empty elements.
 //
@@ -78,7 +75,11 @@ pub fn canonical() -> XmlWriteOptions []
 //     println("${xmlwrite.pretty().indent}")
 // ```
 pub fn pretty() -> XmlWriteOptions []
-    todo("xml-nv.xmlwrite.pretty")
+    XmlWriteOptions { indent: 2,
+        self_close_empty: true,
+        declaration: true,
+        quote: 34,
+        preserve_shape: false }
 
 // The options that reproduce the source: `preserve_shape` set, no
 // declaration added, nothing indented.
@@ -90,7 +91,299 @@ pub fn pretty() -> XmlWriteOptions []
 //     println("${xmlwrite.preserve().preserve_shape}")
 // ```
 pub fn preserve() -> XmlWriteOptions []
-    todo("xml-nv.xmlwrite.preserve")
+    XmlWriteOptions { indent: 0,
+        self_close_empty: true,
+        declaration: false,
+        quote: 34,
+        preserve_shape: true }
+
+// Append a string's bytes to the buffer, with no intermediate copy.
+fn put(var out: [u8], text: Str) -> [u8]
+    for i in 0..str.len(text)
+        list.push(out, str.byte_at_or(text, i, 0) as u8)
+    out
+
+// The byte at `i`, or -1.
+fn at(s: Str, i: Int) -> Int
+    str.byte_at_or(s, i, 0 - 1)
+
+// How many bytes the character at `i` takes when it is an XML Char.
+// A character that is not one answers its length negated, and a byte
+// that does not start a UTF-8 character answers -1.
+fn char_len(s: Str, i: Int) -> Int
+    let c0 = at(s, i)
+    if c0 < 128
+        if c0 < 32 and c0 != 9 and c0 != 10 and c0 != 13
+            return 0 - 1
+        return 1
+    var need = 0
+    var code = 0
+    if c0 >= 194 and c0 <= 223
+        need = 1
+        code = c0 & 31
+    else if c0 >= 224 and c0 <= 239
+        need = 2
+        code = c0 & 15
+    else if c0 >= 240 and c0 <= 244
+        need = 3
+        code = c0 & 7
+    else
+        return 0 - 1
+    for k in 1..need + 1
+        let c = at(s, i + k)
+        if c < 0 or (c & 192) != 128
+            return 0 - 1
+        code = (code << 6) | (c & 63)
+    if need == 2 and code < 2048 or need == 3 and code < 65536
+        return 0 - 1
+    if not xmlparse.is_xml_char(code)
+        return 0 - need - 1
+    need + 1
+
+// The offset of the first character in `s` that is not an XML Char, or
+// -1.
+fn bad_char(s: Str) -> Int
+    var i = 0
+    while at(s, i) >= 0
+        let len = char_len(s, i)
+        if len < 0
+            return i
+        i = i + len
+    0 - 1
+
+// The escape for byte `b`, or `""` to keep it.  `quote` is 0 for
+// character data, and the delimiting quote for an attribute value.
+fn pick(b: Int, quote: Int) -> Str
+    match b
+        38 => "&amp;"
+        60 => "&lt;"
+        13 => "&#13;"
+        62 =>
+            if quote == 0
+                return "&gt;"
+            ""
+        34 =>
+            if quote == 34
+                return "&quot;"
+            ""
+        39 =>
+            if quote == 39
+                return "&apos;"
+            ""
+        9  =>
+            if quote != 0
+                return "&#9;"
+            ""
+        10 =>
+            if quote != 0
+                return "&#10;"
+            ""
+        _  => ""
+
+// `s` with every byte `pick` names replaced by its escape, and every
+// character XML does not allow replaced by U+FFFD.
+fn escaped(s: Str, quote: Int) -> Str
+    var out = ""
+    var run = 0
+    var i = 0
+    let n = str.len(s)
+    while at(s, i) >= 0
+        let len = char_len(s, i)
+        if len < 0
+            out = out + str.slice(s, run, i) + "\u{fffd}"
+            i = i - len
+            run = i
+        else
+            let e = pick(at(s, i), quote)
+            if e != ""
+                out = out + str.slice(s, run, i) + e
+                run = i + 1
+            i = i + len
+    out + str.slice(s, run, n)
+
+// Character data escaped: `&`, `<`, `>` and a carriage return.
+fn text_escape(s: Str) -> Str
+    escaped(s, 0)
+
+// An attribute value escaped for the quote it sits in.  0 is not a
+// quote, and is kept apart from character data's rules.
+fn attr_escape(s: Str, quote: Int) -> Str
+    if quote == 0
+        return escaped(s, 0 - 1)
+    escaped(s, quote)
+
+// The quote an options value asks for: 39, or 34 for anything else.
+fn quote_of(o: XmlWriteOptions) -> Int
+    if o.quote == 39
+        return 39
+    34
+
+// One attribute as ` name="value"`.
+fn attr_str(name: Str, value: Str, quote: Int) -> Str
+    let q = str.from_byte(quote)
+    " " + name + "=" + q + attr_escape(value, quote) + q
+
+// A tag from checked parts: `<tag a="1"` with no closing `>`.
+fn open_tag(tag: Str, attrs: [XmlWriteAttr], quote: Int) -> Result<Str, xmlerror.XmlFault>
+    if not xmlparse.is_name(tag)
+        return Err(xmlerror.fault(XmlBadName, 0, str.len(tag)))
+    var out = "<" + tag
+    for k in 0..list.len(attrs)
+        let a = attrs[k]
+        if not xmlparse.is_name(a.name)
+            return Err(xmlerror.fault(XmlBadName, 0, str.len(a.name)))
+        for j in 0..k
+            if attrs[j].name == a.name
+                return Err(xmlerror.fault(XmlDuplicateAttribute, 0, str.len(a.name)))
+        out = out + attr_str(a.name, a.value, quote)
+    Ok(out)
+
+// `n` spaces.
+fn spaces(n: Int) -> Str
+    str.repeat(" ", n)
+
+// Whether a text node holds only whitespace.
+fn blank(doc: xmltree.XmlDocument, i: Int) -> Bool
+    str.trim(xmltree.text_of(doc, i)) == ""
+
+// Whether a node is a text node or a CDATA section.
+fn is_text(doc: xmltree.XmlDocument, i: Int) -> Bool
+    match doc.nodes[i].kind
+        XmlTextNode(_, _) => true
+        XmlCDataNode(_)   => true
+        _                 => false
+
+// The children an element writes under indentation: all but its
+// text, which is only whitespace when indentation applies.
+fn laid_out(doc: xmltree.XmlDocument, i: Int) -> [Int]
+    list.filter(xmltree.children(doc, i), k => not is_text(doc, k))
+
+// Whether an element holds text other than whitespace, so that no
+// indentation may be added inside it.
+fn mixed(doc: xmltree.XmlDocument, i: Int) -> Bool
+    list.any(xmltree.children(doc, i), k => is_text(doc, k) and not blank(doc, k))
+
+// The offset just past an element's start tag: the first `>` outside a
+// quoted value.
+fn start_tag_end(doc: xmltree.XmlDocument, i: Int) -> Int
+    let src = doc.source
+    var k = doc.nodes[i].span.start
+    var quote = 0
+    while at(src, k) >= 0 and (quote != 0 or at(src, k) != '>')
+        let b = at(src, k)
+        if quote != 0 and b == quote
+            quote = 0
+        else if quote == 0 and (b == '"' or b == '\'')
+            quote = b
+        k = k + 1
+    k + 1
+
+// An element the way the source wrote it.
+fn preserved_element(doc: xmltree.XmlDocument, i: Int, o: XmlWriteOptions) -> Str
+    let n = doc.nodes[i]
+    let tag_end = start_tag_end(doc, i)
+    var out = str.slice(doc.source, n.span.start, tag_end)
+    if n.self_closed
+        return out
+    var inner_end = tag_end
+    for k in xmltree.children(doc, i)
+        out = out + node_str(doc, k, o, 0)
+        inner_end = doc.nodes[k].span.end
+    let tail = str.slice(doc.source, inner_end, n.span.end)
+    if str.starts_with(tail, "</")
+        return out + tail
+    out + "</" + xmltree.tag_of(doc, i) + ">"
+
+// An attribute's value decoded, or its bytes when it does not decode.
+fn attr_text(doc: xmltree.XmlDocument, a: xmltree.XmlTreeAttr) -> Str
+    match xmlparse.decode_attr(xmlparse.scanner(doc.source), a.value)
+        Ok(t)  => t
+        Err(_) => xmltree.slice(doc, a.value)
+
+// An element written to the options.
+fn element_str(doc: xmltree.XmlDocument, i: Int, o: XmlWriteOptions, level: Int) -> Str
+    let tag = xmltree.tag_of(doc, i)
+    var out = "<" + tag
+    for a in xmltree.attrs_of(doc, i)
+        out = out + attr_str(xmltree.slice(doc, a.name.qualified), attr_text(doc, a), quote_of(o))
+    let flat = o.indent == 0 or mixed(doc, i)
+    var kids = xmltree.children(doc, i)
+    if not flat
+        kids = laid_out(doc, i)
+    if list.len(kids) == 0
+        if o.self_close_empty
+            return out + "/>"
+        return out + "></" + tag + ">"
+    out = out + ">"
+    if flat
+        let inner = XmlWriteOptions { indent: 0, self_close_empty: o.self_close_empty, declaration: false,
+                                      quote: o.quote, preserve_shape: false }
+        for k in kids
+            out = out + node_str(doc, k, inner, 0)
+        return out + "</" + tag + ">"
+    for k in kids
+        out = out + "\n" + spaces((level + 1) * o.indent) + node_str(doc, k, o, level + 1)
+    out + "\n" + spaces(level * o.indent) + "</" + tag + ">"
+
+// A processing instruction as `<?target data?>`.
+fn pi_str(doc: xmltree.XmlDocument, t: xmlparse.XmlRange, d: xmlparse.XmlRange) -> Str
+    if d.end == d.start
+        return "<?" + xmltree.slice(doc, t) + "?>"
+    "<?" + xmltree.slice(doc, t) + " " + xmltree.slice(doc, d) + "?>"
+
+// The declaration the options ask for, with a line break after it when
+// the output is indented.
+fn declaration_str(o: XmlWriteOptions) -> Str
+    var decl = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+    if o.indent > 0
+        decl = decl + "\n"
+    decl
+
+// The document node: the declaration, then the top-level nodes.
+fn document_str(doc: xmltree.XmlDocument, o: XmlWriteOptions) -> Str
+    let kids = xmltree.children(doc, 0)
+    var out = ""
+    if o.preserve_shape
+        let from = doc.nodes[0].span.start
+        var upto = doc.nodes[0].span.end
+        if list.len(kids) > 0
+            upto = doc.nodes[kids[0]].span.start
+        out = str.slice(doc.source, from, upto)
+        if o.declaration and not str.contains(out, "<?xml")
+            out = declaration_str(o) + out
+        for k in kids
+            out = out + node_str(doc, k, o, 0)
+        return out
+    if o.declaration
+        out = declaration_str(o)
+    var first = true
+    for k in kids
+        if not is_text(doc, k)
+            if o.indent > 0 and not first
+                out = out + "\n"
+            out = out + node_str(doc, k, o, 0)
+            first = false
+    out
+
+// One node and everything under it.
+fn node_str(doc: xmltree.XmlDocument, i: Int, o: XmlWriteOptions, level: Int) -> Str
+    let n = doc.nodes[i]
+    if o.preserve_shape
+        match n.kind
+            XmlRootNode          =>
+                return document_str(doc, o)
+            XmlElementNode(_, _) =>
+                return preserved_element(doc, i, o)
+            _                    =>
+                return xmltree.slice(doc, n.span)
+    match n.kind
+        XmlRootNode          => document_str(doc, o)
+        XmlElementNode(_, _) => element_str(doc, i, o, level)
+        XmlTextNode(_, _)    => text_escape(xmltree.text_of(doc, i))
+        XmlCDataNode(_)      => text_escape(xmltree.text_of(doc, i))
+        XmlCommentNode(r)    => "<!--" + xmltree.slice(doc, r) + "-->"
+        XmlPiNode(t, d)      => pi_str(doc, t, d)
+        XmlDoctypeNode(r)    => xmltree.slice(doc, r)
 
 // A whole document, appended to `out`.
 //
@@ -104,13 +397,13 @@ pub fn preserve() -> XmlWriteOptions []
 //     let out = xmlwrite.serialize([], doc, xmlwrite.canonical())
 //     println("${list.len(out)}")
 // ```
-pub fn serialize(out: [u8], doc: xmltree.XmlDocument, options: XmlWriteOptions) -> [u8] []
-    todo("xml-nv.xmlwrite.serialize")
+pub fn serialize(var out: [u8], doc: xmltree.XmlDocument, options: XmlWriteOptions) -> [u8] []
+    put(out, document_str(doc, options))
 
-// One node and everything under it, appended to `out`.
+// One node and everything under it, appended to `out`.  An index that
+// names nothing appends nothing.
 //
-// What a caller extracting one record from a feed writes: find the
-// `<item>`, serialise it, drop the rest.
+// What a caller extracting one record from a feed writes.
 //
 // ```novo
 // use std.list
@@ -122,14 +415,16 @@ pub fn serialize(out: [u8], doc: xmltree.XmlDocument, options: XmlWriteOptions) 
 //     let out = xmlwrite.serialize_node([], doc, 2, xmlwrite.canonical())
 //     println("${list.len(out)}")
 // ```
-pub fn serialize_node(out: [u8], doc: xmltree.XmlDocument, index: Int,
+pub fn serialize_node(var out: [u8], doc: xmltree.XmlDocument, index: Int,
                       options: XmlWriteOptions) -> [u8] []
-    todo("xml-nv.xmlwrite.serialize_node")
+    if index < 0 or index >= xmltree.count(doc)
+        return out
+    put(out, node_str(doc, index, options, 0))
 
 // A node's children, appended to `out`, the node itself not written.
 //
-// The inner-XML case: replacing an element's contents without
-// touching its tag.
+// The inner XML of an element.  With indentation, each child starts a
+// line.
 //
 // ```novo
 // use std.list
@@ -141,15 +436,23 @@ pub fn serialize_node(out: [u8], doc: xmltree.XmlDocument, index: Int,
 //     let out = xmlwrite.serialize_children([], doc, 1, xmlwrite.canonical())
 //     println("${list.len(out)}")
 // ```
-pub fn serialize_children(out: [u8], doc: xmltree.XmlDocument, index: Int,
+pub fn serialize_children(var out: [u8], doc: xmltree.XmlDocument, index: Int,
                           options: XmlWriteOptions) -> [u8] []
-    todo("xml-nv.xmlwrite.serialize_children")
+    var kids = xmltree.children(doc, index)
+    let flat = options.indent == 0 or options.preserve_shape or mixed(doc, index)
+    if not flat
+        kids = laid_out(doc, index)
+    var text = ""
+    for k in kids
+        if not flat and text != ""
+            text = text + "\n"
+        text = text + node_str(doc, k, options, 0)
+    put(out, text)
 
-// The convenience for a caller with no buffer to reuse.
+// A whole document as a string.
 //
-// It allocates one, serialises into it and answers a string; a caller
-// writing many documents should keep its own buffer and call
-// `serialize`.
+// It builds one string; a caller writing many documents keeps its own
+// buffer and calls `serialize`.
 //
 // ```novo
 // use xmltree
@@ -160,13 +463,9 @@ pub fn serialize_children(out: [u8], doc: xmltree.XmlDocument, index: Int,
 //     println(xmlwrite.serialize_str(doc, xmlwrite.canonical()))
 // ```
 pub fn serialize_str(doc: xmltree.XmlDocument, options: XmlWriteOptions) -> Str []
-    todo("xml-nv.xmlwrite.serialize_str")
+    document_str(doc, options)
 
 // One attribute a caller is building by hand.
-//
-// A pair of strings rather than an `xmltree.XmlTreeAttr`, because the
-// caller building a document from its own data has no tree and no
-// ranges to make one out of.
 pub struct XmlWriteAttr
     name: Str
     value: Str
@@ -174,21 +473,23 @@ pub struct XmlWriteAttr
 // A start tag from a name and attributes the caller holds as strings.
 //
 // `Err(XmlBadName)` when the tag or an attribute name is not an XML
-// Name — the check that keeps a document built from user input from
-// carrying an element nobody meant to write.  Values are escaped.
+// Name, and `Err(XmlDuplicateAttribute)` when a name repeats; the
+// fault's offsets are within the name refused.  Values are escaped
+// with the options' quote.
 //
 // ```novo
-// use std.list
 // use xmlwrite
 //
 // fn main() [io]
-//     match xmlwrite.write_start_tag([], "item", [], xmlwrite.canonical())
-//         Ok(out) => println("${list.len(out)}")
+//     match xmlwrite.write_start_tag([], "item", [XmlWriteAttr { name: "id", value: "a&b" }], xmlwrite.canonical())
+//         Ok(out) => println(bytes.to_str(bytes.from_byte_list(out)))
 //         Err(_)  => println("not a name")
 // ```
-pub fn write_start_tag(out: [u8], tag: Str, attrs: [XmlWriteAttr],
+pub fn write_start_tag(var out: [u8], tag: Str, attrs: [XmlWriteAttr],
                        options: XmlWriteOptions) -> Result<[u8], xmlerror.XmlFault> []
-    todo("xml-nv.xmlwrite.write_start_tag")
+    match open_tag(tag, attrs, quote_of(options))
+        Ok(t)  => Ok(put(out, t + ">"))
+        Err(f) => Err(f)
 
 // An end tag from a name the caller holds.
 //
@@ -201,10 +502,12 @@ pub fn write_start_tag(out: [u8], tag: Str, attrs: [XmlWriteAttr],
 //         Ok(out) => println("${list.len(out)}")
 //         Err(_)  => println("not a name")
 // ```
-pub fn write_end_tag(out: [u8], tag: Str) -> Result<[u8], xmlerror.XmlFault> []
-    todo("xml-nv.xmlwrite.write_end_tag")
+pub fn write_end_tag(var out: [u8], tag: Str) -> Result<[u8], xmlerror.XmlFault> []
+    if not xmlparse.is_name(tag)
+        return Err(xmlerror.fault(XmlBadName, 0, str.len(tag)))
+    Ok(put(out, "</" + tag + ">"))
 
-// An empty tag — `<item a="1"/>` — from a name and attributes.
+// An empty tag, `<item a="1"/>`, from a name and attributes.
 //
 // ```novo
 // use std.list
@@ -215,17 +518,18 @@ pub fn write_end_tag(out: [u8], tag: Str) -> Result<[u8], xmlerror.XmlFault> []
 //         Ok(out) => println("${list.len(out)}")
 //         Err(_)  => println("not a name")
 // ```
-pub fn write_empty_tag(out: [u8], tag: Str, attrs: [XmlWriteAttr],
+pub fn write_empty_tag(var out: [u8], tag: Str, attrs: [XmlWriteAttr],
                        options: XmlWriteOptions) -> Result<[u8], xmlerror.XmlFault> []
-    todo("xml-nv.xmlwrite.write_empty_tag")
+    match open_tag(tag, attrs, quote_of(options))
+        Ok(t)  => Ok(put(out, t + "/>"))
+        Err(f) => Err(f)
 
 // Character data, escaped.
 //
-// `&` becomes `&amp;`, `<` becomes `&lt;`, `>` becomes `&gt;`.  The
-// third is not required by XML 1.0 and is done anyway, because the
-// only rule about `>` in character data is that `]]>` may not appear,
-// and escaping every `>` makes that rule unnecessary rather than
-// conditional.
+// `&` becomes `&amp;`, `<` becomes `&lt;` and `>` becomes `&gt;`.  The
+// third is not required by XML 1.0; escaping it means `]]>` can never
+// appear.  A carriage return is written `&#13;`, because a parser turns
+// a literal one into a line feed.
 //
 // ```novo
 // use std.list
@@ -235,15 +539,15 @@ pub fn write_empty_tag(out: [u8], tag: Str, attrs: [XmlWriteAttr],
 //     let out = xmlwrite.write_text([], "a < b")
 //     println("${list.len(out)}")
 // ```
-pub fn write_text(out: [u8], text: Str) -> [u8] []
-    todo("xml-nv.xmlwrite.write_text")
+pub fn write_text(var out: [u8], text: Str) -> [u8] []
+    put(out, text_escape(text))
 
 // An attribute value's contents, escaped for the quote it will sit in.
 //
-// `&` and `<` always; the delimiting quote; and tab, newline and
-// carriage return as numeric references, because an attribute value's
-// whitespace is normalised on the way back in and a literal newline
-// would not survive a round trip.
+// `&` and `<` always, the delimiting quote, and tab, line feed and
+// carriage return as numeric references, because a parser turns each
+// of them into a space.  `quote` is 34 or 39; any other value escapes
+// neither quote.
 //
 // ```novo
 // use std.list
@@ -253,15 +557,14 @@ pub fn write_text(out: [u8], text: Str) -> [u8] []
 //     let out = xmlwrite.write_attr_value([], "a \"quoted\" b", 34)
 //     println("${list.len(out)}")
 // ```
-pub fn write_attr_value(out: [u8], value: Str, quote: Int) -> [u8] []
-    todo("xml-nv.xmlwrite.write_attr_value")
+pub fn write_attr_value(var out: [u8], value: Str, quote: Int) -> [u8] []
+    put(out, attr_escape(value, quote))
 
-// A CDATA section around text that is written verbatim.
+// A CDATA section around text written verbatim.
 //
-// `Err(XmlBadCData)` when the text contains `]]>`, because there is no
-// escape for it inside a section and the only correct answer is two
-// sections — which is a decision about the document that belongs to
-// the caller, not to the writer.
+// `Err(XmlBadCData)` when the text holds `]]>`, which a section cannot
+// contain; the caller decides where to split it.  `Err(XmlBadChar)`
+// when it holds a character XML does not allow.
 //
 // ```novo
 // use std.list
@@ -272,15 +575,20 @@ pub fn write_attr_value(out: [u8], value: Str, quote: Int) -> [u8] []
 //         Ok(out) => println("${list.len(out)}")
 //         Err(_)  => println("the text closes the section")
 // ```
-pub fn write_cdata(out: [u8], text: Str) -> Result<[u8], xmlerror.XmlFault> []
-    todo("xml-nv.xmlwrite.write_cdata")
+pub fn write_cdata(var out: [u8], text: Str) -> Result<[u8], xmlerror.XmlFault> []
+    if let Some(i) = str.index(text, "]]>")
+        return Err(xmlerror.fault(XmlBadCData, i, i + 3))
+    let bad = bad_char(text)
+    if bad >= 0
+        return Err(xmlerror.fault(XmlBadChar, bad, bad + 1))
+    Ok(put(out, "<![CDATA[" + text + "]]>"))
 
 // A comment.
 //
-// `Err(XmlBadComment)` when the text contains `--` or ends in `-`.
-// Nothing is escaped and nothing can be: XML gives a comment no escape
-// mechanism at all, so a writer that accepted `--` would be writing a
-// document no parser reads.
+// `Err(XmlBadComment)` when the text holds `--` or ends in `-`: XML
+// gives a comment no escape, so a writer that accepted either would
+// write a document no parser reads.  `Err(XmlBadChar)` when it holds a
+// character XML does not allow.
 //
 // ```novo
 // use std.list
@@ -291,14 +599,23 @@ pub fn write_cdata(out: [u8], text: Str) -> Result<[u8], xmlerror.XmlFault> []
 //         Ok(out) => println("${list.len(out)}")
 //         Err(_)  => println("a comment may not contain --")
 // ```
-pub fn write_comment(out: [u8], text: Str) -> Result<[u8], xmlerror.XmlFault> []
-    todo("xml-nv.xmlwrite.write_comment")
+pub fn write_comment(var out: [u8], text: Str) -> Result<[u8], xmlerror.XmlFault> []
+    if let Some(i) = str.index(text, "--")
+        return Err(xmlerror.fault(XmlBadComment, i, i + 2))
+    if str.ends_with(text, "-")
+        return Err(xmlerror.fault(XmlBadComment, str.len(text) - 1, str.len(text)))
+    let bad = bad_char(text)
+    if bad >= 0
+        return Err(xmlerror.fault(XmlBadChar, bad, bad + 1))
+    Ok(put(out, "<!--" + text + "-->"))
 
-// A processing instruction.
+// A processing instruction, `<?target data?>`.
 //
-// `Err(XmlBadProcessingInstruction)` when the target is `xml` in any
-// case — that one is reserved for the declaration — or when the data
-// contains `?>`.
+// `Err(XmlBadName)` when the target is not a Name,
+// `Err(XmlBadProcessingInstruction)` when it is `xml` in any case,
+// which is reserved for the declaration, or when the data holds `?>`,
+// and `Err(XmlBadChar)` when the data holds a character XML does not
+// allow.
 //
 // ```novo
 // use std.list
@@ -309,13 +626,25 @@ pub fn write_comment(out: [u8], text: Str) -> Result<[u8], xmlerror.XmlFault> []
 //         Ok(out) => println("${list.len(out)}")
 //         Err(_)  => println("reserved target, or ?> in the data")
 // ```
-pub fn write_pi(out: [u8], target: Str, data: Str) -> Result<[u8], xmlerror.XmlFault> []
-    todo("xml-nv.xmlwrite.write_pi")
+pub fn write_pi(var out: [u8], target: Str, data: Str) -> Result<[u8], xmlerror.XmlFault> []
+    if not xmlparse.is_name(target)
+        return Err(xmlerror.fault(XmlBadName, 0, str.len(target)))
+    if str.lower(target) == "xml"
+        return Err(xmlerror.fault(XmlBadProcessingInstruction, 0, 3))
+    if let Some(i) = str.index(data, "?>")
+        return Err(xmlerror.fault(XmlBadProcessingInstruction, i, i + 2))
+    let bad = bad_char(data)
+    if bad >= 0
+        return Err(xmlerror.fault(XmlBadChar, bad, bad + 1))
+    if data == ""
+        return Ok(put(out, "<?" + target + "?>"))
+    Ok(put(out, "<?" + target + " " + data + "?>"))
 
 // The XML declaration.
 //
-// Always `version="1.0" encoding="UTF-8"`, because those are the only
-// two this package reads.  `standalone` is written when it is `Some`.
+// Always `version="1.0" encoding="UTF-8"`, the only version and
+// encoding this package reads, and `standalone="yes"` or `"no"` when
+// `standalone` is `Some`.
 //
 // ```novo
 // use std.list
@@ -325,21 +654,23 @@ pub fn write_pi(out: [u8], target: Str, data: Str) -> Result<[u8], xmlerror.XmlF
 //     let out = xmlwrite.write_declaration([], None)
 //     println("${list.len(out)}")
 // ```
-pub fn write_declaration(out: [u8], standalone: ?Bool) -> [u8] []
-    todo("xml-nv.xmlwrite.write_declaration")
+pub fn write_declaration(var out: [u8], standalone: ?Bool) -> [u8] []
+    match standalone
+        Some(true)  => put(out, "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>")
+        Some(false) => put(out, "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>")
+        None        => put(out, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>")
 
-// How many bytes escaping this text will add.
+// How many bytes `write_text`'s escaping adds to this text.
 //
-// For a caller sizing a buffer before it starts, and for a caller
-// deciding whether a value needs escaping at all: an answer of `0`
-// means the text can be appended as it is.
+// 0 means the text can be appended as it is.  A character XML does not
+// allow counts as the two bytes U+FFFD adds over the one it replaces,
+// or fewer when it was several bytes.
 //
 // ```novo
 // use xmlwrite
 //
 // fn main() [io]
-//     let extra = xmlwrite.escape_overhead("plain")
-//     println("${extra}")
+//     println("${xmlwrite.escape_overhead("plain")}")
 // ```
 pub fn escape_overhead(text: Str) -> Int []
-    todo("xml-nv.xmlwrite.escape_overhead")
+    str.len(text_escape(text)) - str.len(text)

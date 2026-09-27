@@ -1,48 +1,37 @@
-// xmltree.nv — the tolerant tree, as a flat arena over the caller's
-// source, with namespace prefixes already resolved.
+// xmltree.nv — the tolerant tree: a flat arena of nodes over the
+// caller's source, with namespace prefixes resolved.
 //
-// Every body here is a `todo()`; the signatures are the design.
+// The nodes are one list and refer to each other by index, through
+// `parent`, `first_child`, `last_child`, `next_sibling` and
+// `previous_sibling`.  An index is stable for the life of the document
+// and is what every function here and in `xmlfind` takes.
 //
-// THE SHAPE IS THE ONE html-nv AND markdown-nv HAVE: nodes in one
-// list, referring to each other by index, with `parent`,
-// `first_child`, `last_child`, `next_sibling` and `previous_sibling`
-// on every one.  One allocation for the tree rather than one per node,
-// an index that is stable and comparable, and a traversal that is an
-// index walk.  It is also what lets `xmlfind` be arithmetic: a
-// `findall` is a loop over integers.
+// `build` runs the scanner in `xmlparse` and, for the four faults
+// `xmlerror.is_recoverable` names, records an issue and goes on:
 //
-// TOLERANT MEANS ONE NAMED THING, and it is the difference between
-// this module and `xmlparse`.  The scanner is draconian because
-// XML 1.0 § 1.2 requires it.  `build` runs that scanner and, for the
-// four faults `xmlerror.is_recoverable` names, records an issue and
-// keeps going:
+//   an end tag that matches an open        closes every element up to
+//   element other than the innermost one   and including that one
+//                                          (recorded as
+//                                          `XmlMismatchedEnd`)
+//   an end tag that matches no open        dropped (recorded as
+//   element, or comes with nothing open    `XmlStrayEnd`)
+//   the document ending mid-element        everything still open is
+//                                          closed at the end
+//   an undeclared namespace prefix         the name keeps its prefix
+//                                          and is in no namespace
 //
-//   an end tag that does not match     closes up to the nearest
-//                                      ancestor that does, or is
-//                                      dropped if none does
-//   an end tag with nothing open       dropped
-//   the document ending mid-element    everything still open is
-//                                      closed at the end of the source
-//   an undeclared namespace prefix     the name keeps its prefix and
-//                                      resolves to no namespace
+// Any other fault stops the build and is recorded as the last issue,
+// because the scanner cannot say what the next event is.
+// `build_strict` answers the first fault of any kind, which is XML
+// 1.0's own behaviour.
 //
-// Everything else stops the build with the fault, because the scanner
-// cannot say what the next event is and a tree built past it would be
-// a guess.  `build_strict` stops at all of them, which is XML 1.0's
-// own behaviour and what a caller validating a feed wants.
-//
-// NAMESPACES ARE RESOLVED HERE AND NOT ON THE EVENTS, which is the
-// package's other deliberate split.  An `xmlns:` declaration is scoped
-// to the element it is written on, so resolving a prefix needs the
-// stack of open elements — state a pull parser would have to carry for
-// every caller, including the ones scanning a namespace-free document.
-// So `xmlparse` hands over qualified names as written, and this module
-// splits them once, into an index into `doc.namespaces`.
-//
-// `xmlns` ATTRIBUTES ARE KEPT.  They stay in the element's attribute
-// list, resolved like any other name, because a rewriter that dropped
-// them would write a document whose prefixes no longer bind.  A caller
-// walking attributes and not expecting them checks `is_namespace_decl`.
+// Namespaces are resolved here and not on the events, because an
+// `xmlns:` declaration is scoped to its element and resolving a prefix
+// needs the stack of open elements (XML Namespaces 1.0 section 6).  The
+// `xml` prefix is bound to `http://www.w3.org/XML/1998/namespace`
+// without a declaration.  `xmlns` attributes stay in each element's
+// attribute list, in no namespace; `is_namespace_decl` tells them
+// apart.
 
 use xmlerror
 use xmlparse
@@ -52,78 +41,81 @@ pub const XML_NO_NODE = 0 - 1
 
 // The namespace index that means "this name is in no namespace".
 //
-// An unprefixed name with no default declaration in scope, and the
-// name of an element whose prefix was never declared.
+// An unprefixed attribute, an unprefixed element with no default
+// declaration in scope, and a name whose prefix was never declared.
 pub const XML_NO_NAMESPACE = 0 - 1
 
+// The namespace index of the `xml` prefix,
+// `http://www.w3.org/XML/1998/namespace`, which is bound without a
+// declaration and so has no entry in `XmlDocument.namespaces`.
+pub const XML_XML_NAMESPACE = 0 - 2
+
+// The URI the `xml` prefix is bound to.
+const XML_URI: Str = "http://www.w3.org/XML/1998/namespace"
+
+// The URI of the `xmlns` prefix, which no declaration may bind.
+const XMLNS_URI: Str = "http://www.w3.org/2000/xmlns/"
+
 // One namespace binding the document declared.
-//
-// Both halves are ranges into the source: a URI is an attribute value
-// and can be long, and a document with forty elements in one namespace
-// should carry it once.
 pub struct XmlNamespace
     // The prefix it was declared for, `xmlns:p="..."`.  An empty range
     // for the default namespace, `xmlns="..."`.
     prefix: xmlparse.XmlRange
-    // The URI it binds to.
+    // The URI it binds, as the attribute value's range.
     uri: xmlparse.XmlRange
 
 // A name, split and resolved.
 //
-// `qualified` is what the source said, which a rewriter needs; the
-// other three are what a reader means.  Comparing two names for
-// equality is comparing `ns` and the text of `local`, and never the
-// prefix — two documents that spell the same namespace `soap:` and
-// `s:` name the same elements.
+// Two names are equal when their `ns` and the text of their `local`
+// are, never by the prefix: two documents that spell one namespace
+// `soap:` and `s:` name the same elements.
 pub struct XmlName
     // The whole name as written, prefix and colon included.
     qualified: xmlparse.XmlRange
-    // The part before the colon.  Empty when there was none.
+    // The part before the colon.  Empty when there is none.
     prefix: xmlparse.XmlRange
-    // The part after the colon, or the whole name when there was none.
+    // The part after the colon, or the whole name when there is none.
     local: xmlparse.XmlRange
-    // An index into `XmlDocument.namespaces`, or `XML_NO_NAMESPACE`.
+    // An index into `XmlDocument.namespaces`, or `XML_NO_NAMESPACE`,
+    // or `XML_XML_NAMESPACE`.
     ns: Int
 
 // One attribute of an element, with its name resolved.
 //
-// An UNPREFIXED attribute is in NO namespace, never in the default
-// one — XML Namespaces 1.0 § 6.2, and the rule everybody gets wrong.
-// `<a xmlns="urn:x" id="1">` has an element in `urn:x` and an
-// attribute in nothing.
+// An unprefixed attribute is in no namespace, never in the default
+// one (XML Namespaces 1.0 section 6.2).  `<a xmlns="urn:x" id="1">`
+// has an element in `urn:x` and an attribute in no namespace.
 pub struct XmlTreeAttr
     name: XmlName
     // The value between the quotes.
     value: xmlparse.XmlRange
-    // True when the value holds `&`.
+    // Whether the value holds `&` or a literal tab, line feed or
+    // carriage return, so that its text differs from its bytes.
     needs_decoding: Bool
-    // The quote character the value was written with, `34` or `39`.
+    // The quote the value was written with, 34 or 39.
     quote: Int
 
 // What a node is.
 //
-// Seven arms, which is `xmlparse`'s nine less the two a tree has no
-// place for: an empty tag becomes an element with no children, and
-// `XmlEof` is not a node.  Whether an element was written `<a/>` or
-// `<a></a>` is `XmlNode.self_closed`, so the round trip survives.
+// `xmlparse`'s events less the two a tree has no place for: an empty
+// tag becomes an element with no children, and `XmlEof` is not a node.
+// Whether an element was written `<a/>` is `XmlNode.self_closed`.
 pub enum XmlNodeKind
-    // The document node.  Exactly one, at index 0, holding the
-    // declaration, the doctype, any top-level comments and processing
-    // instructions, and the root element.
+    // The document node: exactly one, at index 0.  Its children are the
+    // doctype, the top-level comments, processing instructions and
+    // whitespace, and the root element.
     XmlRootNode
     // An element and its attributes in source order.
     XmlElementNode(name: XmlName, attrs: [XmlTreeAttr])
     // Character data between markup.
     XmlTextNode(text: xmlparse.XmlRange, needs_decoding: Bool)
-    // A CDATA section's contents.  Apart from `XmlTextNode` so that a
-    // writer can put the section back; `inner_text` treats the two the
-    // same, which is what a reader wants.
+    // A CDATA section's contents.
     XmlCDataNode(text: xmlparse.XmlRange)
     // A comment's contents, `<!--` and `-->` excluded.
     XmlCommentNode(text: xmlparse.XmlRange)
     // A processing instruction's target and data.
     XmlPiNode(target: xmlparse.XmlRange, data: xmlparse.XmlRange)
-    // The doctype declaration, whole and unparsed.
+    // The document type declaration, whole and unparsed.
     XmlDoctypeNode(text: xmlparse.XmlRange)
 
 // One node in the arena.
@@ -134,49 +126,361 @@ pub struct XmlNode
     last_child: Int
     next_sibling: Int
     previous_sibling: Int
-    // The byte range of the whole node in the source, open tag and
-    // close tag included.  What a tool that REPLACES a node in the
-    // original document needs — a feed rewriter, a formatter that
-    // touches one element — and the reason every range in this package
-    // is half open.
+    // The byte range of the whole node in the source, start tag and
+    // end tag included.  An element closed by a repair ends where the
+    // repair happened.
     span: xmlparse.XmlRange
-    // True for an element written `<a/>`.  Kept so that `xmlwrite`
-    // with `XmlPreserveShape` writes back what was there.
+    // Whether an element was written `<a/>`.
     self_closed: Bool
 
-// One thing `build` recovered from.
-//
-// The kind is `xmlerror`'s, not a second enum: a tolerant build and a
-// strict one disagree about what to DO with a fault and not about what
-// the fault is, and two vocabularies for one set of problems would be
-// two things to keep in step.
+// One thing `build` recovered from, or the fault it stopped at.
 pub struct XmlIssue
     // Where in the source.
     at: Int
     kind: xmlerror.XmlFaultKind
 
-// A parsed document: the arena, the source the ranges point into, the
-// namespaces it declared, and what the build had to recover from.
+// A parsed document: the arena, the source its ranges point into, the
+// namespaces it declared, and what the build recovered from.
 pub struct XmlDocument
     source: Str
     nodes: [XmlNode]
-    // Every distinct binding any element declared, in the order they
-    // were first seen.  A name's `ns` indexes into this.
+    // Every distinct binding the elements declared, in the order first
+    // seen.  A name's `ns` indexes into this.
     namespaces: [XmlNamespace]
-    // Empty for a well-formed document.  A caller that wants XML 1.0's
-    // strictness back checks that it is empty, or calls `build_strict`
-    // and never builds the tree at all.
+    // Empty for a well-formed document.
     issues: [XmlIssue]
-    // True when an `XmlLimits` bound was reached and the rest of the
+    // Whether an `XmlLimits` bound was reached and the rest of the
     // source was not read.
     truncated: Bool
 
+// The tree while it is being built: the node fields as parallel lists,
+// the open elements, and the namespace bindings in scope.
+struct Builder
+    var kinds: [XmlNodeKind]
+    var parents: [Int]
+    var firsts: [Int]
+    var lasts: [Int]
+    var nexts: [Int]
+    var prevs: [Int]
+    var starts: [Int]
+    var ends: [Int]
+    var closed: [Bool]
+    // The open elements, innermost last: each one's index, its
+    // qualified name, and the length the scope lists had before its
+    // declarations.
+    var stack: [Int]
+    var names: [Str]
+    var marks: [Int]
+    // The bindings in scope, innermost last: a prefix and its
+    // namespace index.
+    var scope_prefix: [Str]
+    var scope_ns: [Int]
+    var namespaces: [XmlNamespace]
+    var issues: [XmlIssue]
+
+// Append a node under `parent` and link it in; answers its index.
+fn add(var b: Builder, kind: XmlNodeKind, parent: Int, from: Int, to: Int, self_closed: Bool) -> Int
+    let idx = list.len(b.kinds)
+    list.push(b.kinds, kind)
+    list.push(b.parents, parent)
+    list.push(b.firsts, XML_NO_NODE)
+    list.push(b.lasts, XML_NO_NODE)
+    list.push(b.nexts, XML_NO_NODE)
+    list.push(b.prevs, XML_NO_NODE)
+    list.push(b.starts, from)
+    list.push(b.ends, to)
+    list.push(b.closed, self_closed)
+    if parent >= 0
+        let last = b.lasts[parent]
+        if last < 0
+            b.firsts[parent] = idx
+        else
+            b.nexts[last] = idx
+        b.prevs[idx] = last
+        b.lasts[parent] = idx
+    idx
+
+// The node new content goes under: the innermost open element, or the
+// document node.
+fn current(b: Builder) -> Int
+    let n = list.len(b.stack)
+    if n == 0
+        return 0
+    b.stack[n - 1]
+
+// Close the innermost open element at `to`, and drop the bindings it
+// declared.
+fn close(var b: Builder, to: Int)
+    let n = list.len(b.stack)
+    b.ends[b.stack[n - 1]] = to
+    let mark = b.marks[n - 1]
+    b.stack = b.stack[0:n - 1]
+    b.names = b.names[0:n - 1]
+    b.marks = b.marks[0:n - 1]
+    b.scope_prefix = b.scope_prefix[0:mark]
+    b.scope_ns = b.scope_ns[0:mark]
+
+// An attribute value, decoded, or its bytes when it does not decode.
+fn value_text(source: Str, r: xmlparse.XmlRange) -> Str
+    match xmlparse.decode_attr(xmlparse.scanner(source), r)
+        Ok(t)  => t
+        Err(_) => str.slice(source, r.start, r.end)
+
+// A name split at its first colon.  A colon at either end splits
+// nothing.
+fn split(source: Str, q: xmlparse.XmlRange, ns: Int) -> XmlName
+    for k in q.start + 1..q.end - 1
+        if str.byte_at_or(source, k, 0) == ':'
+            return XmlName { qualified: q, prefix: XmlRange { start: q.start, end: k },
+                             local: XmlRange { start: k + 1, end: q.end }, ns: ns }
+    XmlName { qualified: q, prefix: XmlRange { start: q.start, end: q.start }, local: q, ns: ns }
+
+// The namespace a prefix is bound to in the current scope: an index,
+// `XML_NO_NAMESPACE` for the empty prefix with no default declared,
+// or -3 for a prefix nothing declared.
+fn lookup(b: Builder, prefix: Str) -> Int
+    let n = list.len(b.scope_prefix)
+    for k in 0..n
+        if b.scope_prefix[n - 1 - k] == prefix
+            return b.scope_ns[n - 1 - k]
+    if prefix == "xml"
+        return XML_XML_NAMESPACE
+    if prefix == ""
+        return XML_NO_NAMESPACE
+    0 - 3
+
+// The index of a binding in `b.namespaces`, adding it when it is new.
+fn intern(var b: Builder, source: Str, prefix: xmlparse.XmlRange, uri: xmlparse.XmlRange) -> Int
+    let p = str.slice(source, prefix.start, prefix.end)
+    let u = value_text(source, uri)
+    for k in 0..list.len(b.namespaces)
+        let each = b.namespaces[k]
+        if str.slice(source, each.prefix.start, each.prefix.end) == p and value_text(source, each.uri) == u
+            return k
+    list.push(b.namespaces, XmlNamespace { prefix: prefix, uri: uri })
+    list.len(b.namespaces) - 1
+
+// Whether a qualified name is `xmlns` or starts `xmlns:`.
+fn is_decl_name(source: Str, q: xmlparse.XmlRange) -> Bool
+    let text = str.slice(source, q.start, q.end)
+    text == "xmlns" or str.starts_with(text, "xmlns:")
+
+// Bring an element's namespace declarations into scope, checking each
+// against XML Namespaces 1.0 section 3: a fault, or `None`.
+fn declare(var b: Builder, source: Str, attrs: [xmlparse.XmlAttr]) -> ?xmlerror.XmlFault
+    for a in attrs
+        if is_decl_name(source, a.name)
+            let uri = value_text(source, a.value)
+            var prefix = XmlRange { start: a.name.end, end: a.name.end }
+            if a.name.end - a.name.start > 5
+                prefix = XmlRange { start: a.name.start + 6, end: a.name.end }
+            let p = str.slice(source, prefix.start, prefix.end)
+            let bad = p == "xmlns" or uri == XMLNS_URI or p == "xml" and uri != XML_URI
+            if bad or p != "xml" and uri == XML_URI or p != "" and uri == ""
+                return Some(xmlerror.fault(XmlBadNamespaceDeclaration, a.name.start, a.value.end + 1))
+            var ns = XML_NO_NAMESPACE
+            if p == "xml"
+                ns = XML_XML_NAMESPACE
+            else if uri != ""
+                ns = intern(b, source, prefix, a.value)
+            list.push(b.scope_prefix, p)
+            list.push(b.scope_ns, ns)
+    None
+
+// Resolve a qualified name in the current scope.  Attributes without a
+// prefix are in no namespace; elements without one are in the default
+// namespace.  An undeclared prefix is recorded as an issue, or answered
+// as the fault under `strict`.
+fn resolve(var b: Builder, source: Str, q: xmlparse.XmlRange, element: Bool,
+           strict: Bool) -> Result<XmlName, xmlerror.XmlFault>
+    let name = split(source, q, XML_NO_NAMESPACE)
+    let prefix = str.slice(source, name.prefix.start, name.prefix.end)
+    if prefix == "" and not element
+        return Ok(name)
+    let ns = lookup(b, prefix)
+    if ns == 0 - 3
+        if strict
+            return Err(xmlerror.fault(XmlUndeclaredPrefix, q.start, q.end))
+        list.push(b.issues, XmlIssue { at: q.start, kind: XmlUndeclaredPrefix })
+        return Ok(name)
+    Ok(split(source, q, ns))
+
+// Add an element for a start or empty tag, with its names resolved:
+// the node's index, or the fault that stops the build.
+fn element(var b: Builder, source: Str, q: xmlparse.XmlRange, attrs: [xmlparse.XmlAttr],
+           span: xmlparse.XmlRange, self_closed: Bool,
+           strict: Bool) -> Result<Int, xmlerror.XmlFault>
+    let mark = list.len(b.scope_prefix)
+    if let Some(f) = declare(b, source, attrs)
+        return Err(f)
+    var tree_attrs: [XmlTreeAttr] = []
+    for a in attrs
+        var name = split(source, a.name, XML_NO_NAMESPACE)
+        if not is_decl_name(source, a.name)
+            match resolve(b, source, a.name, false, strict)
+                Ok(r)  =>
+                    name = r
+                Err(f) =>
+                    return Err(f)
+        list.push(tree_attrs, XmlTreeAttr { name: name, value: a.value, needs_decoding: a.needs_decoding,
+                                            quote: a.quote })
+    match resolve(b, source, q, true, strict)
+        Err(f) =>
+            Err(f)
+        Ok(n)  =>
+            let idx = add(b, XmlElementNode(n, tree_attrs), current(b), span.start, span.end, self_closed)
+            if self_closed
+                b.scope_prefix = b.scope_prefix[0:mark]
+                b.scope_ns = b.scope_ns[0:mark]
+            else
+                list.push(b.stack, idx)
+                list.push(b.names, str.slice(source, q.start, q.end))
+                list.push(b.marks, mark)
+            Ok(idx)
+
+// The node kind for an event that adds a leaf, or `None`.
+fn leaf(kind: xmlparse.XmlEventKind) -> ?XmlNodeKind
+    match kind
+        XmlText(r, needs)              => Some(XmlTextNode(r, needs))
+        XmlCData(r)                    => Some(XmlCDataNode(r))
+        XmlComment(r)                  => Some(XmlCommentNode(r))
+        XmlProcessingInstruction(t, d) => Some(XmlPiNode(t, d))
+        XmlDoctype(r)                  => Some(XmlDoctypeNode(r))
+        _                              => None
+
+// The result of adding an element, as the fault that stops the build
+// or `None`.
+fn stopped_by(r: Result<Int, xmlerror.XmlFault>) -> ?xmlerror.XmlFault
+    match r
+        Err(f) => Some(f)
+        Ok(_)  => None
+
+// Add the node an event stands for; answers a fault that stops the
+// build, or `None`.  The declaration adds nothing.
+fn event(var b: Builder, source: Str, ev: xmlparse.XmlEvent, strict: Bool) -> ?xmlerror.XmlFault
+    match ev.kind
+        XmlStartTag(q, attrs) =>
+            return stopped_by(element(b, source, q, attrs, ev.span, false, strict))
+        XmlEmptyTag(q, attrs) =>
+            return stopped_by(element(b, source, q, attrs, ev.span, true, strict))
+        XmlEndTag(_)          =>
+            close(b, ev.span.end)
+        _                     =>
+            if let Some(k) = leaf(ev.kind)
+                let _ = add(b, k, current(b), ev.span.start, ev.span.end, false)
+    None
+
+// The name of the end tag that starts at `at`.
+fn end_name(source: Str, at: Int) -> Str
+    var e = at + 2
+    for _ in at + 2..str.len(source)
+        let c = str.byte_at_or(source, e, '>')
+        if c == '>' or c == ' ' or c == '\t' or c == '\n' or c == '\r'
+            break
+        e = e + 1
+    str.slice(source, at + 2, e)
+
+// The position in `b.stack` of the innermost open element whose
+// qualified name is `name`, or -1.
+fn open_named(b: Builder, name: Str) -> Int
+    let n = list.len(b.names)
+    for k in 0..n
+        if b.names[n - 1 - k] == name
+            return n - 1 - k
+    0 - 1
+
+// The scanner after an end tag that did not match was dealt with: at
+// `to`, with the innermost `pop` names gone from its open stack.
+fn resume(s: xmlparse.XmlScanner, to: Int, pop: Int) -> xmlparse.XmlScanner
+    let keep = list.len(s.open) - pop
+    XmlScanner { source: s.source, at: to, open: s.open[0:keep], limits: s.limits,
+                          after_root: s.after_root or pop > 0 and keep == 0, doctype_seen: s.doctype_seen }
+
+// Whether an event is an end tag.
+fn is_end_tag(ev: xmlparse.XmlEvent) -> Bool
+    match ev.kind
+        XmlEndTag(_) => true
+        _            => false
+
+// The build: the tree, and the fault it stopped at, if any.  Under
+// `strict` it stops at every fault.  A scanner inside an element builds
+// that element's content and stops at its end tag.
+fn run(start: xmlparse.XmlScanner, strict: Bool) -> (XmlDocument, ?xmlerror.XmlFault)
+    let source = start.source
+    let n = str.len(source)
+    var b = Builder { kinds: [], parents: [], firsts: [], lasts: [], nexts: [], prevs: [], starts: [],
+                      ends: [], closed: [], stack: [], names: [], marks: [], scope_prefix: [], scope_ns: [],
+                      namespaces: [], issues: [] }
+    add(b, XmlRootNode, XML_NO_NODE, start.at, n, false)
+    var s = start
+    var stopped: ?xmlerror.XmlFault = None
+    var end = n
+    var truncated = false
+    var going = true
+    for _ in 0..n + 2
+        if not going
+            break
+        match xmlparse.next_event(s)
+            Ok(step) =>
+                if list.len(b.stack) == 0 and is_end_tag(step.event)
+                    end = step.event.span.start
+                    going = false
+                else
+                    match step.event.kind
+                        XmlEof =>
+                            end = step.event.span.end
+                            going = false
+                        _      =>
+                            if let Some(f) = event(b, source, step.event, strict)
+                                list.push(b.issues, XmlIssue { at: f.at, kind: f.kind })
+                                stopped = Some(f)
+                                end = f.at
+                                going = false
+                            s = step.scanner
+            Err(f)   =>
+                var kind = f.kind
+                var pop = 0
+                if kind == XmlMismatchedEnd
+                    let k = open_named(b, end_name(source, f.at))
+                    if k < 0
+                        kind = XmlStrayEnd
+                    else
+                        pop = list.len(b.stack) - k
+                list.push(b.issues, XmlIssue { at: f.at, kind: kind })
+                if strict or not xmlerror.is_recoverable(kind)
+                    stopped = Some(xmlerror.fault(kind, f.at, f.to))
+                    truncated = kind == XmlLimitExceeded
+                    end = f.at
+                    going = false
+                else if kind == XmlUnexpectedEnd
+                    end = n
+                    going = false
+                else
+                    for k in 0..pop
+                        var to = f.at
+                        if k == pop - 1
+                            to = f.to
+                        close(b, to)
+                    s = resume(s, f.to, pop)
+    for _ in 0..list.len(b.stack)
+        close(b, end)
+    b.ends[0] = end
+    var nodes: [XmlNode] = []
+    for i in 0..list.len(b.kinds)
+        list.push(nodes, XmlNode { kind: b.kinds[i], parent: b.parents[i], first_child: b.firsts[i],
+                                   last_child: b.lasts[i], next_sibling: b.nexts[i],
+                                   previous_sibling: b.prevs[i],
+                                   span: XmlRange { start: b.starts[i], end: b.ends[i] },
+                                   self_closed: b.closed[i] })
+    let doc = XmlDocument { source: source, nodes: nodes, namespaces: b.namespaces, issues: b.issues,
+                            truncated: truncated }
+    (doc, stopped)
+
 // Build a tree, recovering from what can be recovered from.
 //
-// Never fails: the four recoverable faults become issues and
-// everything else stops the scan, leaving the tree built so far with
-// the fault recorded as its last issue.  A caller that wants to know
-// whether anything went wrong reads `doc.issues`.
+// Never fails.  The four recoverable faults become issues, and any
+// other fault stops the scan and is recorded as the last issue, with
+// the tree built so far.
 //
 // ```novo
 // use xmltree
@@ -186,7 +490,7 @@ pub struct XmlDocument
 //     println("${xmltree.count(doc)}")
 // ```
 pub fn build(source: Str) -> XmlDocument []
-    todo("xml-nv.xmltree.build")
+    build_with(source, xmlparse.default_limits())
 
 // Build with limits of the caller's choosing.
 //
@@ -199,13 +503,13 @@ pub fn build(source: Str) -> XmlDocument []
 //     println("${xmltree.count(doc)}")
 // ```
 pub fn build_with(source: Str, limits: xmlparse.XmlLimits) -> XmlDocument []
-    todo("xml-nv.xmltree.build_with")
+    build_from(xmlparse.scanner_with(source, limits))
 
-// Build a tree, or the first well-formedness error.
+// Build a tree, or answer the first fault of any kind.
 //
-// XML 1.0's own behaviour, for a caller who would rather be told than
-// guessed for: a validator, a signature check over a canonical form, a
-// tool whose input is supposed to be machine-written.
+// XML 1.0's own behaviour, for a validator, a signature check or a tool
+// whose input is supposed to be machine-written.  An end tag that
+// matches no open element is `XmlStrayEnd` here too.
 //
 // ```novo
 // use xmltree
@@ -216,15 +520,19 @@ pub fn build_with(source: Str, limits: xmlparse.XmlLimits) -> XmlDocument []
 //         Err(f) => println("${f.at}")
 // ```
 pub fn build_strict(source: Str) -> Result<XmlDocument, xmlerror.XmlFault> []
-    todo("xml-nv.xmltree.build_strict")
+    let (doc, stopped) = run(xmlparse.scanner(source), true)
+    match stopped
+        Some(f) => Err(f)
+        None    => Ok(doc)
 
 // Build a tree from a scanner the caller already has.
 //
-// The seam between the two halves of this package, and the reason
-// neither half re-implements the other: a caller that has scanned as
-// far as an element and now wants a tree of just that element's
-// contents hands the scanner over.  What a streaming reader of a large
-// feed does — scan to each `<item>`, build a small tree, drop it.
+// A fresh scanner builds the whole document.  A scanner inside an
+// element builds that element's content as children of the document
+// node, and stops at the element's end tag, which the build does not
+// consume: the document node's span ends where that end tag starts.  A
+// streaming reader scans to each `<item>`, builds a small tree from
+// there, and drops it.
 //
 // ```novo
 // use xmlparse
@@ -235,7 +543,8 @@ pub fn build_strict(source: Str) -> Result<XmlDocument, xmlerror.XmlFault> []
 //     println("${xmltree.count(doc)}")
 // ```
 pub fn build_from(s: xmlparse.XmlScanner) -> XmlDocument []
-    todo("xml-nv.xmltree.build_from")
+    let (doc, _) = run(s, false)
+    doc
 
 // The document node's index, which is always 0.
 //
@@ -247,14 +556,12 @@ pub fn build_from(s: xmlparse.XmlScanner) -> XmlDocument []
 //     println("${xmltree.root(doc)}")
 // ```
 pub fn root(doc: XmlDocument) -> Int []
-    todo("xml-nv.xmltree.root")
+    0
 
-// The root ELEMENT's index, which is not the same thing.
+// The root element's index, or `None` for a document with no element.
 //
-// An XML document has exactly one element at the top level, and a
-// comment or a processing instruction may sit before it.  This is the
-// element; `root` is the document node above it.  `None` for a source
-// with no element in it at all.
+// The document node is `root`; this is the element under it.  A
+// comment or a processing instruction may come before it.
 //
 // ```novo
 // use xmltree
@@ -266,7 +573,9 @@ pub fn root(doc: XmlDocument) -> Int []
 //         None    => println("no element")
 // ```
 pub fn document_element(doc: XmlDocument) -> ?Int []
-    todo("xml-nv.xmltree.document_element")
+    for i in element_children(doc, 0)
+        return Some(i)
+    None
 
 // How many nodes the tree holds, the document node included.
 //
@@ -278,7 +587,7 @@ pub fn document_element(doc: XmlDocument) -> ?Int []
 //     println("${xmltree.count(doc)}")
 // ```
 pub fn count(doc: XmlDocument) -> Int []
-    todo("xml-nv.xmltree.count")
+    list.len(doc.nodes)
 
 // One node by index, or `None` when the index names nothing.
 //
@@ -292,12 +601,11 @@ pub fn count(doc: XmlDocument) -> Int []
 //         None    => println("no such node")
 // ```
 pub fn node(doc: XmlDocument, index: Int) -> ?XmlNode []
-    todo("xml-nv.xmltree.node")
+    if index < 0 or index >= list.len(doc.nodes)
+        return None
+    Some(doc.nodes[index])
 
 // Whether a node is an element.
-//
-// The check every walk starts with, because text and comments are
-// nodes too and a `findall` over tag names has to skip them.
 //
 // ```novo
 // use xmltree
@@ -307,12 +615,15 @@ pub fn node(doc: XmlDocument, index: Int) -> ?XmlNode []
 //     println("${xmltree.is_element(doc, 1)}")
 // ```
 pub fn is_element(doc: XmlDocument, index: Int) -> Bool []
-    todo("xml-nv.xmltree.is_element")
+    match node(doc, index)
+        Some(n) =>
+            match n.kind
+                XmlElementNode(_, _) => true
+                _                    => false
+        None    => false
 
-// A node's children, in source order.
-//
-// The list, for a caller that would rather have one than walk
-// `first_child` and `next_sibling`.  Empty for a node with none.
+// A node's children, in source order; empty for a node with none or
+// an index that names nothing.
 //
 // ```novo
 // use std.list
@@ -323,12 +634,19 @@ pub fn is_element(doc: XmlDocument, index: Int) -> Bool []
 //     println("${list.len(xmltree.children(doc, 1))}")
 // ```
 pub fn children(doc: XmlDocument, index: Int) -> [Int] []
-    todo("xml-nv.xmltree.children")
+    var out: [Int] = []
+    if index < 0 or index >= list.len(doc.nodes)
+        return out
+    var c = doc.nodes[index].first_child
+    for _ in 0..list.len(doc.nodes)
+        if c < 0
+            break
+        list.push(out, c)
+        c = doc.nodes[c].next_sibling
+    out
 
-// The element children of a node, in source order.
-//
-// `children` without the text, comments and processing instructions —
-// which for a data document is what every caller wanted.
+// The element children of a node, in source order: `children` without
+// the text, comments and processing instructions.
 //
 // ```novo
 // use std.list
@@ -339,11 +657,11 @@ pub fn children(doc: XmlDocument, index: Int) -> [Int] []
 //     println("${list.len(xmltree.element_children(doc, 1))}")
 // ```
 pub fn element_children(doc: XmlDocument, index: Int) -> [Int] []
-    todo("xml-nv.xmltree.element_children")
+    list.filter(children(doc, index), c => is_element(doc, c))
 
 // Every descendant of a node, in document order, the node excluded.
 //
-// What ElementTree's `.iter()` walks.  `xmlfind` is this filtered.
+// What ElementTree's `iter()` walks, less the node itself.
 //
 // ```novo
 // use std.list
@@ -354,58 +672,34 @@ pub fn element_children(doc: XmlDocument, index: Int) -> [Int] []
 //     println("${list.len(xmltree.descendants(doc, 1))}")
 // ```
 pub fn descendants(doc: XmlDocument, index: Int) -> [Int] []
-    todo("xml-nv.xmltree.descendants")
+    var out: [Int] = []
+    if index < 0 or index >= list.len(doc.nodes)
+        return out
+    var c = doc.nodes[index].first_child
+    for _ in 0..list.len(doc.nodes)
+        if c < 0
+            break
+        list.push(out, c)
+        c = next_in_order(doc, c, index)
+    out
 
-// An element's qualified name, as written.
-//
-// The empty string for a node that is not an element, rather than a
-// `?Str`: a caller that has already asked `is_element` should not have
-// to unwrap, and a caller that has not gets an answer that matches no
-// tag.
-//
-// ```novo
-// use xmltree
-//
-// fn main() [io]
-//     let doc = xmltree.build("<ns:a xmlns:ns=\"urn:x\"/>")
-//     println(xmltree.tag_of(doc, 1))
-// ```
-pub fn tag_of(doc: XmlDocument, index: Int) -> Str []
-    todo("xml-nv.xmltree.tag_of")
+// The node after `c` in document order that is still under `top`, or
+// -1.
+fn next_in_order(doc: XmlDocument, c: Int, top: Int) -> Int
+    let n = doc.nodes[c]
+    if n.first_child >= 0
+        return n.first_child
+    var up = c
+    for _ in 0..list.len(doc.nodes)
+        if up == top
+            break
+        let here = doc.nodes[up]
+        if here.next_sibling >= 0
+            return here.next_sibling
+        up = here.parent
+    0 - 1
 
-// An element's local name — the part after the colon.
-//
-// What a reader comparing tags should use, together with
-// `namespace_of`.  Two documents that spell one namespace `soap:` and
-// `s:` agree here and disagree on `tag_of`.
-//
-// ```novo
-// use xmltree
-//
-// fn main() [io]
-//     let doc = xmltree.build("<ns:a xmlns:ns=\"urn:x\"/>")
-//     println(xmltree.local_of(doc, 1))
-// ```
-pub fn local_of(doc: XmlDocument, index: Int) -> Str []
-    todo("xml-nv.xmltree.local_of")
-
-// An element's namespace URI, or `None` when it is in none.
-//
-// ```novo
-// use xmltree
-//
-// fn main() [io]
-//     let doc = xmltree.build("<ns:a xmlns:ns=\"urn:x\"/>")
-//     match xmltree.namespace_of(doc, 1)
-//         Some(u) => println(u)
-//         None    => println("no namespace")
-// ```
-pub fn namespace_of(doc: XmlDocument, index: Int) -> ?Str []
-    todo("xml-nv.xmltree.namespace_of")
-
-// An element's resolved name, for a caller comparing whole names.
-//
-// `None` for a node that is not an element.
+// An element's name, or `None` for a node that is not an element.
 //
 // ```novo
 // use xmltree
@@ -417,9 +711,72 @@ pub fn namespace_of(doc: XmlDocument, index: Int) -> ?Str []
 //         None    => println("not an element")
 // ```
 pub fn name_of(doc: XmlDocument, index: Int) -> ?XmlName []
-    todo("xml-nv.xmltree.name_of")
+    match node(doc, index)
+        Some(n) =>
+            match n.kind
+                XmlElementNode(name, _) => Some(name)
+                _                       => None
+        None    => None
 
-// An element's attributes, in source order, `xmlns` ones included.
+// An element's qualified name, as written, or `""` for a node that is
+// not an element.
+//
+// ```novo
+// use xmltree
+//
+// fn main() [io]
+//     let doc = xmltree.build("<ns:a xmlns:ns=\"urn:x\"/>")
+//     println(xmltree.tag_of(doc, 1))
+// ```
+pub fn tag_of(doc: XmlDocument, index: Int) -> Str []
+    match name_of(doc, index)
+        Some(n) => slice(doc, n.qualified)
+        None    => ""
+
+// An element's local name, the part after the colon, or `""` for a
+// node that is not an element.
+//
+// A reader comparing tags uses this with `namespace_of`.
+//
+// ```novo
+// use xmltree
+//
+// fn main() [io]
+//     let doc = xmltree.build("<ns:a xmlns:ns=\"urn:x\"/>")
+//     println(xmltree.local_of(doc, 1))
+// ```
+pub fn local_of(doc: XmlDocument, index: Int) -> Str []
+    match name_of(doc, index)
+        Some(n) => slice(doc, n.local)
+        None    => ""
+
+// The URI a namespace index stands for, or `None`.
+fn uri_of(doc: XmlDocument, ns: Int) -> ?Str
+    if ns == XML_XML_NAMESPACE
+        return Some(XML_URI)
+    if ns < 0
+        return None
+    Some(value_text(doc.source, doc.namespaces[ns].uri))
+
+// An element's namespace URI, or `None` when it is in none or the node
+// is not an element.
+//
+// ```novo
+// use xmltree
+//
+// fn main() [io]
+//     let doc = xmltree.build("<ns:a xmlns:ns=\"urn:x\"/>")
+//     match xmltree.namespace_of(doc, 1)
+//         Some(u) => println(u)
+//         None    => println("no namespace")
+// ```
+pub fn namespace_of(doc: XmlDocument, index: Int) -> ?Str []
+    match name_of(doc, index)
+        Some(n) => uri_of(doc, n.ns)
+        None    => None
+
+// An element's attributes, in source order, `xmlns` ones included;
+// empty for a node that is not an element.
 //
 // ```novo
 // use std.list
@@ -430,17 +787,19 @@ pub fn name_of(doc: XmlDocument, index: Int) -> ?XmlName []
 //     println("${list.len(xmltree.attrs_of(doc, 1))}")
 // ```
 pub fn attrs_of(doc: XmlDocument, index: Int) -> [XmlTreeAttr] []
-    todo("xml-nv.xmltree.attrs_of")
+    match node(doc, index)
+        Some(n) =>
+            match n.kind
+                XmlElementNode(_, attrs) => list.clone(attrs)
+                _                        => []
+        None    => []
 
-// One attribute's value by unprefixed name, decoded.
+// One attribute's value by name, decoded, or `None`.
 //
-// Matches an attribute in NO namespace, which is what an unprefixed
-// attribute is — see `XmlTreeAttr`.  `None` when the element has no
-// such attribute, and `None` too when the value would not decode,
-// which is the one place this package swallows a fault: an attribute
-// value with a bad entity in it is a document that `build_strict`
-// already refuses, and a getter returning a `Result` would put a match
-// in front of every read.
+// Matches an attribute in no namespace, which is what an unprefixed
+// attribute is.  The value is decoded as `xmlparse.decode_attr` does; a
+// value that does not decode, which only a hand-built tree can hold,
+// answers `None`.
 //
 // ```novo
 // use xmltree
@@ -450,13 +809,23 @@ pub fn attrs_of(doc: XmlDocument, index: Int) -> [XmlTreeAttr] []
 //     println(xmltree.attr(doc, 1, "id") ?? "absent")
 // ```
 pub fn attr(doc: XmlDocument, index: Int, name: Str) -> ?Str []
-    todo("xml-nv.xmltree.attr")
+    for a in attrs_of(doc, index)
+        if a.name.ns == XML_NO_NAMESPACE and slice(doc, a.name.qualified) == name
+            return decoded(doc, a.value)
+    None
 
-// One attribute's value by namespace URI and local name.
+// An attribute value decoded, or `None` when it does not decode.
+fn decoded(doc: XmlDocument, r: xmlparse.XmlRange) -> ?Str
+    match xmlparse.decode_attr(xmlparse.scanner(doc.source), r)
+        Ok(t)  => Some(t)
+        Err(_) => None
+
+// One attribute's value by namespace URI and local name, decoded, or
+// `None`.
 //
-// For the attributes that really are in a namespace — `xsi:type`,
-// `xlink:href` — where matching on the prefix would be matching on a
-// spelling the document chose.
+// For attributes in a namespace, such as `xsi:type` and `xlink:href`,
+// where matching on the prefix would match a spelling the document
+// chose.
 //
 // ```novo
 // use xmltree
@@ -466,13 +835,13 @@ pub fn attr(doc: XmlDocument, index: Int, name: Str) -> ?Str []
 //     println(xmltree.attr_ns(doc, 1, "urn:x", "k") ?? "absent")
 // ```
 pub fn attr_ns(doc: XmlDocument, index: Int, uri: Str, local: Str) -> ?Str []
-    todo("xml-nv.xmltree.attr_ns")
+    for a in attrs_of(doc, index)
+        if uri_of(doc, a.name.ns) == Some(uri) and slice(doc, a.name.local) == local
+            return decoded(doc, a.value)
+    None
 
-// Whether an attribute is a namespace declaration.
-//
-// `xmlns` or `xmlns:something`.  The check a caller walking
-// `attrs_of` makes when it is copying attributes somewhere the
-// bindings do not apply.
+// Whether an attribute is a namespace declaration: `xmlns` or
+// `xmlns:something`.
 //
 // ```novo
 // use std.list
@@ -484,7 +853,7 @@ pub fn attr_ns(doc: XmlDocument, index: Int, uri: Str, local: Str) -> ?Str []
 //     println("${xmltree.is_namespace_decl(doc, a)}")
 // ```
 pub fn is_namespace_decl(doc: XmlDocument, a: XmlTreeAttr) -> Bool []
-    todo("xml-nv.xmltree.is_namespace_decl")
+    is_decl_name(doc.source, a.name.qualified)
 
 // The source text a range names, exactly as written.
 //
@@ -497,14 +866,17 @@ pub fn is_namespace_decl(doc: XmlDocument, a: XmlTreeAttr) -> Bool []
 //     println(xmltree.slice(doc, XmlRange { start: 3, end: 5 }))
 // ```
 pub fn slice(doc: XmlDocument, r: xmlparse.XmlRange) -> Str []
-    todo("xml-nv.xmltree.slice")
+    str.slice(doc.source, r.start, r.end)
 
-// A node's own text, decoded.
+// A node's own text: a text node decoded, a CDATA section's contents,
+// a comment's contents, a processing instruction's data.  Line ends are
+// normalised in each, as XML 1.0 section 2.11 requires of the whole
+// document.
 //
-// The contents of a text node or a CDATA section, the contents of a
-// comment, the data of a processing instruction.  The empty string for
-// an element — an element's text is its children's, and conflating the
-// two is what makes `findtext` surprising in every library that does.
+// The empty string for an element, the document node and a doctype.
+// An element's text is its children's, which `inner_text` collects.  A
+// text node that does not decode, which only a hand-built tree can
+// hold, answers its bytes.
 //
 // ```novo
 // use xmltree
@@ -514,10 +886,27 @@ pub fn slice(doc: XmlDocument, r: xmlparse.XmlRange) -> Str []
 //     println(xmltree.text_of(doc, 2))
 // ```
 pub fn text_of(doc: XmlDocument, index: Int) -> Str []
-    todo("xml-nv.xmltree.text_of")
+    match node(doc, index)
+        None    => ""
+        Some(n) =>
+            match n.kind
+                XmlTextNode(r, _)  =>
+                    match xmlparse.decode(xmlparse.scanner(doc.source), r)
+                        Ok(t)  => t
+                        Err(_) => slice(doc, r)
+                XmlCDataNode(r)    => lines(slice(doc, r))
+                XmlCommentNode(r)  => lines(slice(doc, r))
+                XmlPiNode(_, data) => lines(slice(doc, data))
+                _                  => ""
 
-// Every descendant text node and CDATA section of a node, decoded and
-// concatenated.
+// Text with its line ends normalised: a carriage return and line feed
+// become a line feed, and so does a lone carriage return (XML 1.0
+// section 2.11).
+fn lines(text: Str) -> Str
+    str.replace(str.replace(text, "\r\n", "\n"), "\r", "\n")
+
+// Every text node and CDATA section under a node, decoded and
+// concatenated, in document order.
 //
 // ElementTree's `itertext()` joined.  Comments and processing
 // instructions contribute nothing.
@@ -530,12 +919,21 @@ pub fn text_of(doc: XmlDocument, index: Int) -> Str []
 //     println(xmltree.inner_text(doc, 1))
 // ```
 pub fn inner_text(doc: XmlDocument, index: Int) -> Str []
-    todo("xml-nv.xmltree.inner_text")
+    var out = ""
+    for i in descendants(doc, index)
+        match doc.nodes[i].kind
+            XmlTextNode(_, _) =>
+                out = out + text_of(doc, i)
+            XmlCDataNode(_)   =>
+                out = out + text_of(doc, i)
+            _                 => ()
+    out
 
-// A namespace's URI by the prefix it was declared for.
+// A namespace's URI by the prefix it was first declared for, or
+// `None`.
 //
-// An empty `prefix` asks for the default namespace.  `None` when
-// nothing declared it.
+// An empty `prefix` asks for the default namespace, and `xml` answers
+// the XML namespace without a declaration.
 //
 // ```novo
 // use xmltree
@@ -545,13 +943,14 @@ pub fn inner_text(doc: XmlDocument, index: Int) -> Str []
 //     println(xmltree.namespace_uri(doc, "p") ?? "unbound")
 // ```
 pub fn namespace_uri(doc: XmlDocument, prefix: Str) -> ?Str []
-    todo("xml-nv.xmltree.namespace_uri")
+    for each in doc.namespaces
+        if slice(doc, each.prefix) == prefix
+            return Some(value_text(doc.source, each.uri))
+    if prefix == "xml"
+        return Some(XML_URI)
+    None
 
-// One line about an issue, for a linter's output.
-//
-// The issue is a value so a caller can decide which ones it cares
-// about; this is here so a caller that only wants to print it does not
-// write the match first.
+// One line about an issue: the line, the column and the kind's name.
 //
 // ```novo
 // use xmltree
@@ -562,12 +961,10 @@ pub fn namespace_uri(doc: XmlDocument, prefix: Str) -> ?Str []
 //         println(xmltree.issue_text(doc, i))
 // ```
 pub fn issue_text(doc: XmlDocument, issue: XmlIssue) -> Str []
-    todo("xml-nv.xmltree.issue_text")
+    let s = xmlparse.scanner(doc.source)
+    "line ${xmlparse.line_of(s, issue.at)}, column ${xmlparse.column_of(s, issue.at)}: ${xmlerror.kind_name(issue.kind)}"
 
-// The issues a build recorded.
-//
-// A function rather than a field read so that a caller that only wants
-// the count does not depend on the field's name.
+// The issues a build recorded, in the order it met them.
 //
 // ```novo
 // use std.list
@@ -578,4 +975,4 @@ pub fn issue_text(doc: XmlDocument, issue: XmlIssue) -> Str []
 //     println("${list.len(xmltree.issues_of(doc))}")
 // ```
 pub fn issues_of(doc: XmlDocument) -> [XmlIssue] []
-    todo("xml-nv.xmltree.issues_of")
+    list.clone(doc.issues)

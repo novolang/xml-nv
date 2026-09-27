@@ -1,173 +1,139 @@
-// xmlparse.nv — the pull parser: bytes in, events out, no tree.
+// xmlparse.nv — the pull parser: a source string in, events out, no
+// tree.
 //
-// Every body here is a `todo()`; the signatures are the design.
+// `next_event` takes a scanner value and answers an event and the
+// scanner that follows it.  The scanner is the source, an offset, the
+// stack of open element names and a few flags.  An event allocates
+// nothing but the attribute list of a tag and, on a start or end tag,
+// a copy of the open-name stack.  `xmltree.build` is this loop with an
+// arena under it, and `xmlwrite` is its inverse.
 //
-// THE LOAD-BEARING INTERFACE OF THE PACKAGE IS `next_event`.  A
-// scanner value, an event, and the scanner that follows it — the state
-// is three integers and a small stack of open-element ranges, nothing
-// is allocated per event, and the caller decides when the next one
-// happens.  Everything else in this package is built on it:
-// `xmltree.build` is this loop with an arena under it, `xmlwrite` is
-// its inverse, and a caller streaming a 400 MB feed never calls either.
+// Every event is a range of byte offsets into the source, never a copy.
+// `&amp;` is not a substring of the document, so decoding is a separate
+// call: `decode` for text and `decode_attr` for an attribute value.
 //
-// EVERY EVENT IS A RANGE INTO THE SOURCE, never a copy.  A start tag
-// answers where its name is and where each attribute's name and value
-// are; text answers where the run of character data is.  That is what
-// makes a scan of a large document cost no allocation at all, and it
-// is why `decode` is a separate call: `&amp;` is not a substring of
-// the document, so a caller that needs the TEXT asks for it and a
-// caller that only needs to know an element was seen does not.
+// The source is a `Str`, which is UTF-8.  An `<?xml encoding=...?>`
+// naming anything else is `XmlUnsupportedEncoding` rather than a
+// transcode.  Every character is checked against XML 1.0's Char
+// production (section 2.2) and every name against its Name production
+// (section 2.3).
 //
-// THE SOURCE IS A `Str`, NOT `Bytes`, and the choice has a
-// consequence a reader should meet here rather than in a surprise.
-// novo-lang's `Str` is UTF-8, so this package reads UTF-8 and an
-// `<?xml encoding="ISO-8859-1"?>` is `XmlUnsupportedEncoding` rather
-// than a transcode: a `core` package has no encoding tables, and
-// answering Latin-1 bytes as if they were UTF-8 would corrupt text
-// silently rather than refuse loudly.  A caller holding other bytes
-// decodes them first.  The ranges are still BYTE offsets, so
-// everything above about zero copies holds.
-//
-// WHAT XML 1.0 IS NOT HERE.  The README lists it; the short version is
-// that there is no DTD beyond the five predefined entities, no
-// validation, no entity expansion of the caller's own entities, and no
-// XInclude.  A document that declares an internal subset is not
-// refused — the subset's bytes come back as one `XmlDoctype` event,
-// unparsed — but an `&mine;` inside it is `XmlBadEntity`.
+// There is no DTD beyond the five predefined entities.  A document
+// type declaration is not refused: its bytes come back as one
+// `XmlDoctype` event, unparsed, internal subset included.  A reference
+// to an entity the subset declares is `XmlBadEntity`.
 
 use xmlerror
 
-// The five predefined entities, and nothing else, are expanded.
+// How many entities are predefined, and so expanded: five.
 //
-// `&lt;` `&gt;` `&amp;` `&apos;` `&quot;`, plus `&#nn;` and `&#xNN;`.
-// A count rather than a list because a caller does not need the list;
-// it needs to know the number is five and not "whatever the DTD said".
+// `&lt;` `&gt;` `&amp;` `&apos;` `&quot;`, plus the numeric references
+// `&#nn;` and `&#xNN;`.
 pub const PREDEFINED_ENTITIES = 5
 
 // A byte range into the source the caller holds.
 //
-// Half open: `start` is the first byte, `end` is one past the last, so
-// `end - start` is the length and an empty range has them equal.
+// Half open: `start` is the first byte and `end` is one past the last,
+// so `end - start` is the length and an empty range has them equal.
 pub struct XmlRange
     start: Int
     end: Int
 
 // One attribute of a start or empty tag, as written.
 //
-// The name is the QUALIFIED name — `xmlns:foo` and `foo:bar` arrive
-// whole, prefix included — because prefixes are resolved on the tree
-// and not on the events.  `xmltree` is what splits them.
+// The name is the qualified name, prefix included.  Prefixes are
+// resolved on the tree, in `xmltree`.
 pub struct XmlAttr
     // The attribute's name, as written.
     name: XmlRange
     // The value between the quotes, quotes excluded.
     value: XmlRange
-    // True when the value holds `&` and so is not the text it looks
-    // like.  A caller comparing an id against a literal checks this
-    // first and calls `decode` only when it is set, which for real
-    // documents is almost never.
+    // Whether the value holds `&`, so that its text differs from its
+    // bytes.  A caller comparing a value against a literal calls
+    // `decode_attr` only when this is set.
     needs_decoding: Bool
-    // Which quote the value was written with: `34` for `"` and `39`
-    // for `'`.  Kept so a rewriter can put the document back the way
-    // it found it.
+    // The quote the value was written with: 34 for `"` and 39 for `'`.
     quote: Int
 
 // What the scanner found.
 //
-// Nine arms, which is XML 1.0's own list of what can appear in a
-// document plus the end of it.  A pull parser that collapsed
-// `XmlEmptyTag` into a start and an end would lose the one thing a
-// rewriter needs to reproduce the source.
+// XML 1.0's own list of what a document can contain, plus its end.
 pub enum XmlEventKind
     // `<tag a="1">`: the qualified name and the attributes in source
     // order.
     XmlStartTag(name: XmlRange, attrs: [XmlAttr])
     // `</tag>`: the qualified name.
     XmlEndTag(name: XmlRange)
-    // `<tag a="1"/>`: a start and an end in one construct, and kept as
-    // one so that `xmlwrite` can write back what was written.
+    // `<tag a="1"/>`: a start and an end in one construct, kept as one
+    // so that a rewriter can write back what was written.
     XmlEmptyTag(name: XmlRange, attrs: [XmlAttr])
     // A run of character data between markup.  `needs_decoding` is set
-    // when it holds `&`; whitespace-only runs are reported like any
-    // other, because in XML — unlike HTML — whitespace inside an
-    // element is content until a schema says otherwise, and this
-    // package has no schema.
+    // when it holds `&` or a carriage return.  Whitespace-only runs are
+    // reported like any other, because whitespace inside an element is
+    // content, and so are the runs of whitespace outside the root
+    // element.
     XmlText(text: XmlRange, needs_decoding: Bool)
-    // `<![CDATA[...]]>`: the contents, delimiters excluded.  Never
-    // decoded — that is what a CDATA section is for — and kept apart
-    // from `XmlText` so a rewriter can put the section back.
+    // `<![CDATA[...]]>`: the contents, delimiters excluded.
     XmlCData(text: XmlRange)
     // `<!-- ... -->`: the contents, delimiters excluded.
     XmlComment(text: XmlRange)
-    // `<?target data?>`: the target and everything after the first
-    // space, `?>` excluded.  `data` is an empty range for `<?tgt?>`.
+    // `<?target data?>`: the target, and the data after the whitespace
+    // that follows it, `?>` excluded.  `data` is empty for `<?tgt?>`.
     XmlProcessingInstruction(target: XmlRange, data: XmlRange)
-    // `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>`, whose
-    // pseudo-attributes are parsed because the encoding one decides
-    // whether this package can read the document at all.
+    // `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>`: the
+    // three values, each an empty range when absent.
     XmlDeclaration(version: XmlRange, encoding: XmlRange, standalone: XmlRange)
-    // `<!DOCTYPE ...>`, WHOLE AND UNPARSED — the range covers `<!` to
-    // the matching `>`, internal subset included, and nothing in this
-    // package looks inside it.  A caller that needs the subset has the
-    // bytes; a caller that does not can skip the event.
+    // `<!DOCTYPE ...>`, whole and unparsed: the range covers `<!` to
+    // the matching `>`, internal subset included.
     XmlDoctype(text: XmlRange)
-    // The document ended.  The last event of every successful scan,
-    // and the one a `while` loop stops on.
+    // The document ended.  The last event of every successful scan.
     XmlEof
 
 // An event and where it was.
 pub struct XmlEvent
     kind: XmlEventKind
-    // The byte range of the whole construct, delimiters included.
-    // What a tool that REWRITES a document in place needs: replace
-    // these bytes and leave the rest untouched.
+    // The byte range of the whole construct, delimiters included.  A
+    // tool that rewrites a document in place replaces these bytes.
     span: XmlRange
 
-// What the scanner will not do.
+// The bounds the scanner enforces.
 //
-// Bounds rather than a promise of termination: XML's pathological
-// inputs are a file of 200,000 nested elements and an element with a
-// million attributes, and both are a few lines to write.  There is no
-// entity-expansion bound because there is no entity expansion — the
-// billion-laughs attack needs an internal DTD subset, and this package
-// does not read one.
+// XML's pathological inputs are a file of 200,000 nested elements and
+// an element with a million attributes.  There is no entity-expansion
+// bound because there is no entity expansion.
 pub struct XmlLimits
     // How deeply elements may nest before `XmlLimitExceeded`.
     max_depth: Int
     // How many attributes one element may carry.
     max_attributes: Int
-    // How long a single name may be, in bytes.  A guard on the one
-    // construct that can grow without a delimiter in sight.
+    // How long a single name may be, in bytes.
     max_name_length: Int
 
 // The scanner between two events.
 //
 // A value, so a caller can hold one, copy one, or keep two over the
-// same source.  `open` is the stack of qualified-name ranges of the
-// elements that are open — the one thing a scanner must carry to
-// answer `XmlMismatchedEnd` — and it is ranges rather than strings
-// because a name is already in the source.
+// same source.  `next_event` never changes the scanner it is given.
 pub struct XmlScanner
-    // The document.  Held here because a range without its string is
-    // meaningless.
+    // The document.
     source: Str
     // How far the scan has reached.
     at: Int
-    // The qualified names of the currently open elements, outermost
-    // first.
+    // The qualified names of the open elements, outermost first.
     open: [XmlRange]
     limits: XmlLimits
-    // True once the root element has closed, so that trailing content
+    // Whether the root element has closed, so that content after it
     // can be told from content.
     after_root: Bool
+    // Whether a document type declaration has been read.
+    doctype_seen: Bool
 
 // An event and the scanner that follows it.
 pub struct XmlStep
     scanner: XmlScanner
     event: XmlEvent
 
-// Bounds no real document reaches: 256 deep, 4096 attributes, names of
-// 1024 bytes.
+// Bounds no ordinary document reaches: 256 deep, 4096 attributes,
+// names of 1024 bytes.
 //
 // ```novo
 // use xmlparse
@@ -176,7 +142,7 @@ pub struct XmlStep
 //     println("${xmlparse.default_limits().max_depth}")
 // ```
 pub fn default_limits() -> XmlLimits []
-    todo("xml-nv.xmlparse.default_limits")
+    XmlLimits { max_depth: 256, max_attributes: 4096, max_name_length: 1024 }
 
 // A scanner over a source string, at the default limits.
 //
@@ -188,7 +154,7 @@ pub fn default_limits() -> XmlLimits []
 //     println("${s.at}")
 // ```
 pub fn scanner(source: Str) -> XmlScanner []
-    todo("xml-nv.xmlparse.scanner")
+    scanner_with(source, default_limits())
 
 // A scanner with limits of the caller's choosing.
 //
@@ -200,19 +166,247 @@ pub fn scanner(source: Str) -> XmlScanner []
 //     println("${s.at}")
 // ```
 pub fn scanner_with(source: Str, limits: XmlLimits) -> XmlScanner []
-    todo("xml-nv.xmlparse.scanner_with")
+    XmlScanner { source: source,
+        at: 0,
+        open: [],
+        limits: limits,
+        after_root: false,
+        doctype_seen: false }
+
+// The byte at `i`, or -1 outside the source.
+fn at(src: Str, i: Int) -> Int
+    str.byte_at_or(src, i, 0 - 1)
+
+// A fault as the answer of `next_event`.
+fn stop(kind: xmlerror.XmlFaultKind, from: Int, to: Int) -> Result<XmlStep, xmlerror.XmlFault>
+    Err(xmlerror.fault(kind, from, to))
+
+// The answer of `next_event` for an event that ends at `to`.
+fn emit(s: XmlScanner, kind: XmlEventKind, from: Int, to: Int, open: [XmlRange], after_root: Bool,
+        doctype_seen: Bool) -> Result<XmlStep, xmlerror.XmlFault>
+    let next = XmlScanner { source: s.source, at: to, open: open, limits: s.limits, after_root: after_root,
+                            doctype_seen: doctype_seen }
+    Ok(XmlStep { scanner: next,
+        event: XmlEvent { kind: kind, span: XmlRange { start: from, end: to } } })
+
+// The same, for an event that leaves the scanner's state as it was.
+fn plain(s: XmlScanner, kind: XmlEventKind, from: Int,
+         to: Int) -> Result<XmlStep, xmlerror.XmlFault>
+    emit(s, kind, from, to, s.open, s.after_root, s.doctype_seen)
+
+// The character at `i`, decoded from UTF-8, as `code * 8 + length`, or
+// -1 for bytes that are not UTF-8 or the end of the source.
+fn char_at(src: Str, i: Int) -> Int
+    let c0 = at(src, i)
+    if c0 < 128
+        if c0 < 0
+            return 0 - 1
+        return c0 * 8 + 1
+    var need = 0
+    var code = 0
+    var least = 0
+    if c0 >= 194 and c0 <= 223
+        need = 1
+        code = c0 & 31
+        least = 128
+    else if c0 >= 224 and c0 <= 239
+        need = 2
+        code = c0 & 15
+        least = 2048
+    else if c0 >= 240 and c0 <= 244
+        need = 3
+        code = c0 & 7
+        least = 65536
+    else
+        return 0 - 1
+    for k in 1..need + 1
+        let c = at(src, i + k)
+        if c < 0 or (c & 192) != 128
+            return 0 - 1
+        code = (code << 6) | (c & 63)
+    if code < least or code > 1114111 or code >= 55296 and code <= 57343
+        return 0 - 1
+    code * 8 + need + 1
+
+// Whether a code point is allowed in an XML 1.0 document at all.
+//
+// The Char production (section 2.2): tab, line feed, carriage return,
+// then U+0020 to U+D7FF, U+E000 to U+FFFD and U+10000 to U+10FFFF.
+// Surrogates and most C0 controls are not characters in XML, which is
+// why `&#0;` is a fault and not a NUL.
+//
+// ```novo
+// use xmlparse
+//
+// fn main() [io]
+//     println("${xmlparse.is_xml_char(9)}")
+// ```
+pub fn is_xml_char(code: Int) -> Bool []
+    if code == 9 or code == 10 or code == 13
+        return true
+    if code >= 32 and code <= 55295
+        return true
+    code >= 57344 and code <= 65533 or code >= 65536 and code <= 1114111
+
+// Whether a code point may start a Name (NameStartChar, section 2.3).
+fn name_start(c: Int) -> Bool
+    if c >= 'a' and c <= 'z' or c >= 'A' and c <= 'Z' or c == '_' or c == ':'
+        return true
+    if c < 192
+        return false
+    if c <= 214 or c >= 216 and c <= 246 or c >= 248 and c <= 767
+        return true
+    if c >= 880 and c <= 893 or c >= 895 and c <= 8191 or c == 8204 or c == 8205
+        return true
+    if c >= 8304 and c <= 8591 or c >= 11264 and c <= 12271 or c >= 12289 and c <= 55295
+        return true
+    c >= 63744 and c <= 64975 or c >= 65008 and c <= 65533 or c >= 65536 and c <= 983039
+
+// Whether a code point may continue a Name (NameChar, section 2.3).
+fn name_char(c: Int) -> Bool
+    if c == '-' or c == '.' or c >= '0' and c <= '9' or c == 183
+        return true
+    c >= 768 and c <= 879 or c == 8255 or c == 8256 or name_start(c)
+
+// The offset just past the run of NameChar characters starting at `i`.
+fn name_end(src: Str, i: Int) -> Int
+    var j = i
+    var ch = char_at(src, j)
+    while ch >= 0 and name_char(ch >> 3)
+        j = j + (ch & 7)
+        ch = char_at(src, j)
+    j
+
+// Whether a run found by `name_end` is a Name: not empty, and starting
+// with a NameStartChar.
+fn is_name_run(src: Str, from: Int, to: Int) -> Bool
+    to > from and name_start(char_at(src, from) >> 3)
+
+// Whether a string is an XML 1.0 Name.
+//
+// The NameStartChar and NameChar productions (section 2.3): a letter,
+// `_` or `:` to start, then letters, digits, `.`, `-`, `_`, `:` and the
+// combining ranges.  `xmlwrite` checks every name a caller supplies
+// with this before it writes a tag.
+//
+// ```novo
+// use xmlparse
+//
+// fn main() [io]
+//     println("${xmlparse.is_name("item")}")
+// ```
+pub fn is_name(s: Str) -> Bool []
+    let end = name_end(s, 0)
+    end == str.len(s) and is_name_run(s, 0, end)
+
+// Whether a byte is XML whitespace: space, tab, line feed or carriage
+// return (the S production, section 2.3).
+fn is_ws(b: Int) -> Bool
+    b == ' ' or b == '\t' or b == '\n' or b == '\r'
+
+// The first offset at or after `i` that is not whitespace.
+fn skip_ws(src: Str, i: Int) -> Int
+    var j = i
+    while is_ws(at(src, j))
+        j = j + 1
+    j
+
+// Whether `text` is at offset `i` of the source.
+fn has(src: Str, i: Int, text: Str) -> Bool
+    for k in 0..str.len(text)
+        if at(src, i + k) != str.byte_at_or(text, k, 0)
+            return false
+    true
+
+// Whether two ranges hold the same bytes.
+fn same(src: Str, a: XmlRange, b: XmlRange) -> Bool
+    if a.end - a.start != b.end - b.start
+        return false
+    for k in 0..a.end - a.start
+        if at(src, a.start + k) != at(src, b.start + k)
+            return false
+    true
+
+// The code point one of the five predefined entity names stands for,
+// or `None`.
+//
+// `lt` is 60, `gt` 62, `amp` 38, `apos` 39 and `quot` 34: the names
+// without the `&` and the `;`.
+//
+// ```novo
+// use xmlparse
+//
+// fn main() [io]
+//     match xmlparse.entity_value("amp")
+//         Some(c) => println("${c}")
+//         None    => println("not predefined")
+// ```
+pub fn entity_value(name: Str) -> ?Int []
+    match name
+        "lt"   => Some(60)
+        "gt"   => Some(62)
+        "amp"  => Some(38)
+        "apos" => Some(39)
+        "quot" => Some(34)
+        _      => None
+
+// The value of a hexadecimal digit, or -1.
+fn hex_digit(b: Int) -> Int
+    if b >= '0' and b <= '9'
+        return b - '0'
+    if b >= 'a' and b <= 'f'
+        return b - 'a' + 10
+    if b >= 'A' and b <= 'F'
+        return b - 'A' + 10
+    0 - 1
+
+// The reference that starts with `&` at `amp`: the code point it
+// stands for and the offset just past its `;`.
+fn reference(src: Str, amp: Int) -> Result<(Int, Int), xmlerror.XmlFault>
+    if at(src, amp + 1) != '#'
+        let e = name_end(src, amp + 1)
+        if at(src, e) != ';' or not is_name_run(src, amp + 1, e)
+            return Err(xmlerror.fault(XmlBadEntity, amp, e))
+        match entity_value(str.slice(src, amp + 1, e))
+            Some(c) =>
+                return Ok((c, e + 1))
+            None    =>
+                return Err(xmlerror.fault(XmlBadEntity, amp, e + 1))
+    var i = amp + 2
+    var base = 10
+    if at(src, i) == 'x'
+        base = 16
+        i = i + 1
+    let first = i
+    var code = 0
+    var d = hex_digit(at(src, i))
+    while d >= 0 and d < base
+        if code <= 1114111
+            code = code * base + d
+        i = i + 1
+        d = hex_digit(at(src, i))
+    if i == first or at(src, i) != ';' or not is_xml_char(code)
+        return Err(xmlerror.fault(XmlBadCharRef, amp, i + 1))
+    Ok((code, i + 1))
+
+// How many bytes the character at `i` takes, or -1 when it is not an
+// XML Char or not UTF-8.
+fn char_len(src: Str, i: Int) -> Int
+    let ch = char_at(src, i)
+    if ch < 0 or not is_xml_char(ch >> 3)
+        return 0 - 1
+    ch & 7
 
 // The next event, or the fault that stopped the scan.
 //
-// **The load-bearing interface.**  Call it until the kind is `XmlEof`.
-// The scanner in the step is the one to call it on next; the one
-// passed in is unchanged, so a caller that wants to look ahead and
-// then not can simply drop the step.
+// Call it until the kind is `XmlEof`.  The scanner in the step is the
+// one to call it on next; the one passed in is unchanged, so a caller
+// may look ahead and then drop the step.  After `XmlEof` it answers
+// `XmlEof` again.
 //
-// It is fatal on a well-formedness error because XML 1.0 § 1.2 says a
-// processor must not continue past one.  `xmltree.build` is the
-// tolerant reading of the same events, and it is built on this
-// function rather than on a second scanner.
+// It stops at a well-formedness error because XML 1.0 section 1.2 says
+// a processor must not continue past one.  `xmltree.build` is the
+// tolerant reading of the same events.
 //
 // ```novo
 // use xmlparse
@@ -226,9 +420,392 @@ pub fn scanner_with(source: Str, limits: XmlLimits) -> XmlScanner []
 //                 _                    => println("not a start tag")
 // ```
 pub fn next_event(s: XmlScanner) -> Result<XmlStep, xmlerror.XmlFault> []
-    todo("xml-nv.xmlparse.next_event")
+    let src = s.source
+    let n = str.len(src)
+    var i = s.at
+    if i == 0 and has(src, 0, "\u{feff}")
+        i = 3
+    if i >= n
+        if list.len(s.open) > 0 or not s.after_root
+            return stop(XmlUnexpectedEnd, n, n)
+        return plain(s, XmlEof, n, n)
+    if at(src, i) != '<'
+        return text(s, i)
+    let c = at(src, i + 1)
+    if c == '/'
+        return end_tag(s, i)
+    if c == '?'
+        return instruction(s, i)
+    if c == '!'
+        if has(src, i, "<!--")
+            return comment(s, i)
+        if has(src, i, "<![CDATA[")
+            return cdata(s, i)
+        if has(src, i, "<!DOCTYPE")
+            return doctype(s, i)
+        if i + 2 >= n
+            return stop(XmlUnexpectedEnd, n, n)
+        return stop(XmlBadTag, i, i + 2)
+    start_tag(s, i)
 
-// How deep the scanner currently is: the number of open elements.
+// A run of character data from `i` to the next `<`.
+fn text(s: XmlScanner, i: Int) -> Result<XmlStep, xmlerror.XmlFault>
+    let src = s.source
+    let outside = list.len(s.open) == 0
+    var j = i
+    var needs = false
+    while at(src, j) >= 0 and at(src, j) != '<'
+        let b = at(src, j)
+        if outside and not is_ws(b)
+            return stop(XmlTrailingContent, i, j + 1)
+        if b == '&'
+            match reference(src, j)
+                Err(f)       =>
+                    return Err(f)
+                Ok((_, end)) =>
+                    needs = true
+                    j = end
+        else if b == ']' and has(src, j, "]]>")
+            return stop(XmlBadCData, j, j + 3)
+        else
+            let len = char_len(src, j)
+            if len < 0
+                return stop(XmlBadChar, j, j + 1)
+            if b == '\r'
+                needs = true
+            j = j + len
+    plain(s, XmlText(XmlRange { start: i, end: j }, needs), i, j)
+
+// The bytes from `from` up to the first `close`, checked as XML Chars:
+// the offset of `close`, or a fault.
+fn chars_until(src: Str, from: Int, close: Str) -> Result<Int, xmlerror.XmlFault>
+    var j = from
+    while not has(src, j, close)
+        if at(src, j) < 0
+            return Err(xmlerror.fault(XmlUnexpectedEnd, j, j))
+        let len = char_len(src, j)
+        if len < 0
+            return Err(xmlerror.fault(XmlBadChar, j, j + 1))
+        j = j + len
+    Ok(j)
+
+// `<!-- ... -->`.  Two hyphens may not appear inside, so a comment
+// ending `--->` is refused too.
+fn comment(s: XmlScanner, i: Int) -> Result<XmlStep, xmlerror.XmlFault>
+    let src = s.source
+    match chars_until(src, i + 4, "--")
+        Err(f) => Err(f)
+        Ok(k)  =>
+            if at(src, k + 2) != '>'
+                if k + 2 >= str.len(src)
+                    return stop(XmlUnexpectedEnd, k + 2, k + 2)
+                return stop(XmlBadComment, k, k + 2)
+            plain(s, XmlComment(XmlRange { start: i + 4, end: k }), i, k + 3)
+
+// `<![CDATA[ ... ]]>`, which may appear only inside the root element.
+fn cdata(s: XmlScanner, i: Int) -> Result<XmlStep, xmlerror.XmlFault>
+    if list.len(s.open) == 0
+        return stop(XmlBadCData, i, i + 9)
+    match chars_until(s.source, i + 9, "]]>")
+        Err(f) => Err(f)
+        Ok(k)  => plain(s, XmlCData(XmlRange { start: i + 9, end: k }), i, k + 3)
+
+// A name at `from` checked against the Name production and the
+// length limit: the offset just past it, or a fault.  `missing` is the
+// fault for an empty name.
+fn read_name(s: XmlScanner, from: Int,
+             missing: xmlerror.XmlFaultKind) -> Result<Int, xmlerror.XmlFault>
+    let src = s.source
+    let e = name_end(src, from)
+    if e == from
+        if from >= str.len(src)
+            return Err(xmlerror.fault(XmlUnexpectedEnd, from, from))
+        return Err(xmlerror.fault(missing, from, from + 1))
+    if not is_name_run(src, from, e)
+        return Err(xmlerror.fault(XmlBadName, from, e))
+    if e - from > s.limits.max_name_length
+        return Err(xmlerror.fault(XmlLimitExceeded, from, e))
+    Ok(e)
+
+// `<?target data?>`, and the XML declaration when it is the first
+// thing in the document.
+fn instruction(s: XmlScanner, i: Int) -> Result<XmlStep, xmlerror.XmlFault>
+    let src = s.source
+    match read_name(s, i + 2, XmlBadProcessingInstruction)
+        Err(f) => Err(f)
+        Ok(e)  =>
+            let target = str.slice(src, i + 2, e)
+            if target == "xml"
+                let first = i == 0 or i == 3 and has(src, 0, "\u{feff}")
+                if first and s.at == 0
+                    return declaration(s, i, e)
+                return stop(XmlBadDeclaration, i, e)
+            if str.lower(target) == "xml"
+                return stop(XmlBadProcessingInstruction, i, e)
+            if has(src, e, "?>")
+                return plain(s, XmlProcessingInstruction(XmlRange { start: i + 2, end: e },
+                                                         XmlRange { start: e, end: e }),
+                                                         i, e + 2)
+            if not is_ws(at(src, e))
+                if e >= str.len(src)
+                    return stop(XmlUnexpectedEnd, e, e)
+                return stop(XmlBadProcessingInstruction, e, e + 1)
+            let d = skip_ws(src, e)
+            match chars_until(src, d, "?>")
+                Err(f) => Err(f)
+                Ok(k)  =>
+                    plain(s, XmlProcessingInstruction(XmlRange { start: i + 2, end: e },
+                                                      XmlRange { start: d, end: k }),
+                                                      i, k + 2)
+
+// One pseudo-attribute of the declaration, `name = "value"`, starting
+// after the whitespace before it: the range of the value, or a fault.
+fn pseudo(src: Str, from: Int, name: Str, decl: Int) -> Result<XmlRange, xmlerror.XmlFault>
+    let eq = skip_ws(src, from + str.len(name))
+    if at(src, eq) != '='
+        return Err(xmlerror.fault(XmlBadDeclaration, decl, eq + 1))
+    let q = skip_ws(src, eq + 1)
+    let quote = at(src, q)
+    if quote != '"' and quote != '\''
+        return Err(xmlerror.fault(XmlBadDeclaration, decl, q + 1))
+    match str.index_from(src, str.from_byte(quote), q + 1)
+        Some(close) => Ok(XmlRange { start: q + 1, end: close })
+        None        => Err(xmlerror.fault(XmlUnexpectedEnd, str.len(src), str.len(src)))
+
+// Whether a range holds `1.` followed by one or more digits, the
+// VersionNum production.
+fn version_ok(src: Str, r: XmlRange) -> Bool
+    if r.end - r.start < 3 or not has(src, r.start, "1.")
+        return false
+    for k in r.start + 2..r.end
+        let b = at(src, k)
+        if b < '0' or b > '9'
+            return false
+    true
+
+// `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>`, with the
+// pseudo-attributes in that order and the last two optional (section
+// 2.8).  `e` is the offset just past `xml`.
+fn declaration(s: XmlScanner, i: Int, e: Int) -> Result<XmlStep, xmlerror.XmlFault>
+    let src = s.source
+    let none = XmlRange { start: e, end: e }
+    var w = skip_ws(src, e)
+    if w == e or not has(src, w, "version")
+        return stop(XmlBadDeclaration, i, w + 1)
+    var version = none
+    match pseudo(src, w, "version", i)
+        Err(f) =>
+            return Err(f)
+        Ok(r)  =>
+            version = r
+    if not version_ok(src, version)
+        return stop(XmlBadDeclaration, version.start, version.end)
+    var j = version.end + 1
+    var encoding = none
+    w = skip_ws(src, j)
+    if w > j and has(src, w, "encoding")
+        match pseudo(src, w, "encoding", i)
+            Err(f) =>
+                return Err(f)
+            Ok(r)  =>
+                encoding = r
+        if str.lower(str.slice(src, encoding.start, encoding.end)) != "utf-8"
+            return stop(XmlUnsupportedEncoding, encoding.start, encoding.end)
+        j = encoding.end + 1
+    var standalone = none
+    w = skip_ws(src, j)
+    if w > j and has(src, w, "standalone")
+        match pseudo(src, w, "standalone", i)
+            Err(f) =>
+                return Err(f)
+            Ok(r)  =>
+                standalone = r
+        let v = str.slice(src, standalone.start, standalone.end)
+        if v != "yes" and v != "no"
+            return stop(XmlBadDeclaration, standalone.start, standalone.end)
+        j = standalone.end + 1
+    w = skip_ws(src, j)
+    if not has(src, w, "?>")
+        if w >= str.len(src)
+            return stop(XmlUnexpectedEnd, w, w)
+        return stop(XmlBadDeclaration, w, w + 1)
+    plain(s, XmlDeclaration(version, encoding, standalone), i, w + 2)
+
+// `<!DOCTYPE ...>`, skipped to its matching `>` without being parsed.
+//
+// Quoted literals, and the comments, processing instructions and
+// literals of an internal subset in `[...]`, may hold `>`, so they are
+// stepped over.  A document type declaration must come before the root
+// element and only once.
+fn doctype(s: XmlScanner, i: Int) -> Result<XmlStep, xmlerror.XmlFault>
+    let src = s.source
+    let n = str.len(src)
+    if s.doctype_seen or s.after_root or list.len(s.open) > 0
+        return stop(XmlBadDeclaration, i, i + 9)
+    if not is_ws(at(src, i + 9))
+        if i + 9 >= n
+            return stop(XmlUnexpectedEnd, n, n)
+        return stop(XmlBadDeclaration, i, i + 10)
+    var j = i + 9
+    var subset = false
+    while at(src, j) >= 0
+        let b = at(src, j)
+        if b == '"' or b == '\''
+            j = past(src, str.from_byte(b), j + 1)
+        else if subset and has(src, j, "<!--")
+            j = past(src, "-->", j + 4)
+        else if subset and has(src, j, "<?")
+            j = past(src, "?>", j + 2)
+        else if b == '['
+            subset = true
+            j = j + 1
+        else if b == ']'
+            subset = false
+            j = j + 1
+        else if b == '>' and not subset
+            return emit(s, XmlDoctype(XmlRange { start: i, end: j + 1 }), i, j + 1, s.open, s.after_root, true)
+        else
+            j = j + 1
+    stop(XmlUnexpectedEnd, n, n)
+
+// The offset just past the first `close` at or after `from`, or the
+// end of the source when there is none.
+fn past(src: Str, close: Str, from: Int) -> Int
+    match str.index_from(src, close, from)
+        Some(k) => k + str.len(close)
+        None    => str.len(src)
+
+// The attributes of a tag from `from`, which is just past the name, to
+// the closing `>` or `/>`: the attributes and the offset of the `>`
+// or the `/`.
+fn attributes(s: XmlScanner, from: Int) -> Result<([XmlAttr], Int), xmlerror.XmlFault>
+    let src = s.source
+    var attrs: [XmlAttr] = []
+    var j = from
+    var w = skip_ws(src, j)
+    while at(src, w) >= 0 and at(src, w) != '>' and at(src, w) != '/'
+        if w == j
+            return Err(xmlerror.fault(XmlBadTag, w, w + 1))
+        match attribute(s, w, attrs)
+            Err(f) =>
+                return Err(f)
+            Ok(a)  =>
+                list.push(attrs, a)
+                j = a.value.end + 1
+        w = skip_ws(src, j)
+    if at(src, w) < 0
+        return Err(xmlerror.fault(XmlUnexpectedEnd, w, w))
+    Ok((attrs, w))
+
+// One attribute starting at `w`, checked against those before it on
+// the same tag.
+fn attribute(s: XmlScanner, w: Int, before: [XmlAttr]) -> Result<XmlAttr, xmlerror.XmlFault>
+    let src = s.source
+    let n = str.len(src)
+    match read_name(s, w, XmlBadTag)
+        Err(f) => Err(f)
+        Ok(e)  =>
+            let eq = skip_ws(src, e)
+            if at(src, eq) != '='
+                if eq >= n
+                    return Err(xmlerror.fault(XmlUnexpectedEnd, n, n))
+                return Err(xmlerror.fault(XmlBadTag, eq, eq + 1))
+            let q = skip_ws(src, eq + 1)
+            let quote = at(src, q)
+            if quote != '"' and quote != '\''
+                if q >= n
+                    return Err(xmlerror.fault(XmlUnexpectedEnd, n, n))
+                return Err(xmlerror.fault(XmlUnquotedAttribute, w, q + 1))
+            match attr_value(src, q + 1, quote)
+                Err(f)             => Err(f)
+                Ok((close, needs)) =>
+                    let name = XmlRange { start: w, end: e }
+                    for a in before
+                        if same(src, a.name, name)
+                            return Err(xmlerror.fault(XmlDuplicateAttribute, w, close + 1))
+                    if list.len(before) >= s.limits.max_attributes
+                        return Err(xmlerror.fault(XmlLimitExceeded, w, close + 1))
+                    Ok(XmlAttr { name: name, value: XmlRange { start: q + 1, end: close },
+                                 needs_decoding: needs, quote: quote })
+
+// An attribute value from `from` to its closing quote: the offset of
+// the quote and whether the value needs decoding.
+fn attr_value(src: Str, from: Int, quote: Int) -> Result<(Int, Bool), xmlerror.XmlFault>
+    var j = from
+    var needs = false
+    while at(src, j) != quote
+        let b = at(src, j)
+        if b < 0
+            return Err(xmlerror.fault(XmlUnexpectedEnd, j, j))
+        if b == '<'
+            return Err(xmlerror.fault(XmlBadTag, j, j + 1))
+        if b == '&'
+            match reference(src, j)
+                Err(f)       =>
+                    return Err(f)
+                Ok((_, end)) =>
+                    needs = true
+                    j = end
+        else
+            let len = char_len(src, j)
+            if len < 0
+                return Err(xmlerror.fault(XmlBadChar, j, j + 1))
+            if b == '\t' or b == '\n' or b == '\r'
+                needs = true
+            j = j + len
+    Ok((j, needs))
+
+// `<tag ...>` or `<tag .../>`.
+fn start_tag(s: XmlScanner, i: Int) -> Result<XmlStep, xmlerror.XmlFault>
+    let src = s.source
+    match read_name(s, i + 1, XmlBadTag)
+        Err(f) => Err(f)
+        Ok(e)  =>
+            let name = XmlRange { start: i + 1, end: e }
+            if s.after_root
+                return stop(XmlMultipleRoots, i, e)
+            if list.len(s.open) >= s.limits.max_depth
+                return stop(XmlLimitExceeded, i, e)
+            match attributes(s, e)
+                Err(f)             => Err(f)
+                Ok((attrs, close)) =>
+                    if at(src, close) == '/'
+                        if at(src, close + 1) != '>'
+                            if close + 1 >= str.len(src)
+                                return stop(XmlUnexpectedEnd, close + 1, close + 1)
+                            return stop(XmlBadTag, close, close + 1)
+                        let root_done = s.after_root or list.len(s.open) == 0
+                        return emit(s,
+                            XmlEmptyTag(name, attrs),
+                            i,
+                            close + 2,
+                            s.open,
+                            root_done,
+                            s.doctype_seen)
+                    var open = list.clone(s.open)
+                    list.push(open, name)
+                    emit(s, XmlStartTag(name, attrs), i, close + 1, open, false, s.doctype_seen)
+
+// `</tag>`, which must name the innermost open element.
+fn end_tag(s: XmlScanner, i: Int) -> Result<XmlStep, xmlerror.XmlFault>
+    let src = s.source
+    match read_name(s, i + 2, XmlBadTag)
+        Err(f) => Err(f)
+        Ok(e)  =>
+            let w = skip_ws(src, e)
+            if at(src, w) != '>'
+                if w >= str.len(src)
+                    return stop(XmlUnexpectedEnd, w, w)
+                return stop(XmlBadTag, w, w + 1)
+            let depth = list.len(s.open)
+            if depth == 0
+                return stop(XmlStrayEnd, i, w + 1)
+            let name = XmlRange { start: i + 2, end: e }
+            if not same(src, s.open[depth - 1], name)
+                return stop(XmlMismatchedEnd, i, w + 1)
+            emit(s, XmlEndTag(name), i, w + 1, s.open[0:depth - 1], depth == 1, s.doctype_seen)
+
+// How deep the scanner is: the number of open elements.
 //
 // ```novo
 // use xmlparse
@@ -238,13 +815,12 @@ pub fn next_event(s: XmlScanner) -> Result<XmlStep, xmlerror.XmlFault> []
 //     println("${xmlparse.depth(s)}")
 // ```
 pub fn depth(s: XmlScanner) -> Int []
-    todo("xml-nv.xmlparse.depth")
+    list.len(s.open)
 
 // The source text a range names, exactly as written.
 //
-// No decoding: `&amp;` comes back as `&amp;`.  What a caller comparing
-// a tag name against a literal wants, because a tag name cannot
-// contain an entity reference in the first place.
+// No decoding: `&amp;` comes back as `&amp;`.  A tag name cannot hold
+// a reference, so this is what a caller comparing names wants.
 //
 // ```novo
 // use xmlparse
@@ -254,16 +830,47 @@ pub fn depth(s: XmlScanner) -> Int []
 //     println(xmlparse.text_at(s, XmlRange { start: 1, end: 2 }))
 // ```
 pub fn text_at(s: XmlScanner, r: XmlRange) -> Str []
-    todo("xml-nv.xmlparse.text_at")
+    str.slice(s.source, r.start, r.end)
 
-// The source text a range names, with entity and character references
-// expanded.
+// Expand the references in a range, and normalise its line ends: a
+// carriage return and line feed become one line feed, and a lone
+// carriage return becomes a line feed (section 2.11).  With `attr` set,
+// each whitespace character then becomes a space, as section 3.3.3
+// normalises an attribute value; a character written as a reference is
+// kept as it is.
+fn expand(src: Str, r: XmlRange, attr: Bool) -> Result<Str, xmlerror.XmlFault>
+    var out = ""
+    var run = r.start
+    for j in r.start..r.end
+        let b = at(src, j)
+        // A reference, or a carriage return and line feed, spans bytes
+        // the loop passes over after it has read them.
+        let fresh = j >= run
+        if fresh and b == '&'
+            match reference(src, j)
+                Err(f)          =>
+                    return Err(f)
+                Ok((code, end)) =>
+                    out = out + str.slice(src, run, j) + str.from_char(code)
+                    run = end
+        else if fresh and (b == '\r' or attr and (b == '\n' or b == '\t'))
+            var put = "\n"
+            if attr
+                put = " "
+            out = out + str.slice(src, run, j) + put
+            run = j + 1
+            if b == '\r' and j + 1 < r.end and at(src, j + 1) == '\n'
+                run = j + 2
+    Ok(out + str.slice(src, run, r.end))
+
+// The text a range names, with references expanded and line ends
+// normalised.
 //
-// The five predefined entities and `&#nn;` / `&#xNN;`.  Anything else
-// is `XmlBadEntity`, with the offset of the `&`.  Call it only when
-// the event said `needs_decoding`; on a range with no `&` in it the
-// answer is `text_at`'s and the check is a scan the caller did not
-// need.
+// The five predefined entities and `&#nn;` / `&#xNN;` are expanded.
+// Anything else is `XmlBadEntity`, or `XmlBadCharRef` for a numeric
+// reference to a character XML does not allow, with the offset of the
+// `&`.  A carriage return and line feed become one line feed, and a
+// lone carriage return becomes a line feed (section 2.11).
 //
 // ```novo
 // use xmlparse
@@ -275,83 +882,50 @@ pub fn text_at(s: XmlScanner, r: XmlRange) -> Str []
 //         Err(_) => println("bad entity")
 // ```
 pub fn decode(s: XmlScanner, r: XmlRange) -> Result<Str, xmlerror.XmlFault> []
-    todo("xml-nv.xmlparse.decode")
+    expand(s.source, r, false)
 
-// The code point one of the five predefined entity names stands for,
-// or `None`.
+// An attribute value's text: references expanded, then each tab, line
+// feed and carriage return written literally replaced by a space.
 //
-// `"lt"` is 60, `"gt"` 62, `"amp"` 38, `"apos"` 39, `"quot"` 34 — the
-// names WITHOUT the `&` and the `;`.  Public because a caller writing
-// its own decoder over the same ranges should not have to re-type the
-// table, and because it is how a reader checks that the five really
-// are all of them.
+// This is XML 1.0 section 3.3.3's normalisation for an attribute with
+// no declared type, which is every attribute here.  A character written
+// as a reference, `&#10;`, is kept.
 //
 // ```novo
 // use xmlparse
 //
 // fn main() [io]
-//     match xmlparse.entity_value("amp")
-//         Some(c) => println("${c}")
-//         None    => println("not predefined")
+//     let s = xmlparse.scanner("<a t=\"x\ny&#10;z\"/>")
+//     match xmlparse.decode_attr(s, XmlRange { start: 6, end: 15 })
+//         Ok(t)  => println(t)
+//         Err(_) => println("bad entity")
 // ```
-pub fn entity_value(name: Str) -> ?Int []
-    todo("xml-nv.xmlparse.entity_value")
-
-// Whether a code point is allowed in an XML 1.0 document at all.
-//
-// The Char production: tab, newline, carriage return, then U+0020 to
-// U+D7FF, U+E000 to U+FFFD, U+10000 to U+10FFFF.  Surrogates and most
-// C0 controls are not characters in XML, which is why `&#0;` is a
-// fault and not a NUL.
-//
-// ```novo
-// use xmlparse
-//
-// fn main() [io]
-//     println("${xmlparse.is_xml_char(9)}")
-// ```
-pub fn is_xml_char(code: Int) -> Bool []
-    todo("xml-nv.xmlparse.is_xml_char")
-
-// Whether a string is an XML 1.0 Name.
-//
-// The NameStartChar and NameChar productions: a letter, `_` or `:` to
-// start, then letters, digits, `.`, `-`, `_` and `:`.  Used by
-// `xmlwrite` before it writes a tag a caller supplied, so that a
-// serialiser cannot be talked into emitting `<a><script>` from a name.
-//
-// ```novo
-// use xmlparse
-//
-// fn main() [io]
-//     let ok = xmlparse.is_name("item")
-//     println("${ok}")
-// ```
-pub fn is_name(s: Str) -> Bool []
-    todo("xml-nv.xmlparse.is_name")
+pub fn decode_attr(s: XmlScanner, r: XmlRange) -> Result<Str, xmlerror.XmlFault> []
+    expand(s.source, r, true)
 
 // The 1-based line a byte offset falls on.
 //
-// A scan from the start of the source, so a caller that wants a
-// position for every event should keep its own counter instead.  This
-// is for the one offset in a fault.
+// A scan from the start of the source, meant for the one offset in a
+// fault.  An offset past the end counts every line.
 //
 // ```novo
 // use xmlparse
 //
 // fn main() [io]
-//     let s = xmlparse.scanner("<a>hi</a>")
-//     println("${xmlparse.line_of(s, 4)}")     // 1 — no newline before it
+//     let s = xmlparse.scanner("<a>\nhi</a>")
+//     println("${xmlparse.line_of(s, 5)}")     // 2
 // ```
 pub fn line_of(s: XmlScanner, offset: Int) -> Int []
-    todo("xml-nv.xmlparse.line_of")
+    var line = 1
+    for k in 0..offset
+        if at(s.source, k) == '\n'
+            line = line + 1
+    line
 
 // The 1-based column, in bytes, a byte offset falls on.
 //
 // Bytes rather than characters: a column in characters needs a
-// grapheme table, and this package does not carry one.  A diagnostic
-// that underlines with the source beside it gets the right answer
-// anyway.
+// grapheme table, and this package does not carry one.
 //
 // ```novo
 // use xmlparse
@@ -361,4 +935,9 @@ pub fn line_of(s: XmlScanner, offset: Int) -> Int []
 //     println("${xmlparse.column_of(s, 4)}")   // 5
 // ```
 pub fn column_of(s: XmlScanner, offset: Int) -> Int []
-    todo("xml-nv.xmlparse.column_of")
+    var col = 1
+    for k in 0..offset
+        col = col + 1
+        if at(s.source, k) == '\n'
+            col = 1
+    col

@@ -1,35 +1,17 @@
-// xmlerror.nv — the one fault type, and the offset it happened at.
+// xmlerror.nv — the one fault type, and the offsets it happened at.
 //
-// Every body here is a `todo()`; the signatures are the design.
+// XML 1.0 section 1.2 makes a well-formedness error fatal: a conforming
+// processor "MUST NOT continue normal processing" after one.  The
+// scanner in `xmlparse` therefore answers the first error as a fault
+// and stops.  `xmltree.build` takes the same faults and, for the four
+// that `is_recoverable` names, records an issue and goes on.
 //
-// WHY THERE IS AN ERROR TYPE AT ALL, WHEN html-nv HAS NONE.  The two
-// packages look like siblings and differ on exactly this point,
-// because the two specifications differ on it.  HTML5 defines a
-// parse for every byte sequence, so html-nv returns a document and a
-// list of recoveries.  XML 1.0 § 1.2 defines a well-formedness error
-// as FATAL — a conforming processor "MUST NOT continue normal
-// processing" — so a scanner that answered a document for
-// `<a></b>` would be answering something the specification says does
-// not exist.
-//
-// So the scanner is draconian and this type is what it says no with.
-// The tolerance the package's row promises lives one level up, in
-// `xmltree.build`, which takes the same fatal faults and records them
-// as issues instead — and `xmltree.build_strict` is there for a
-// caller who wants XML 1.0's own behaviour back.
-//
-// EVERY FAULT CARRIES AN OFFSET AND NOTHING ELSE.  Not a line, not a
-// column, not a rendered sentence: an offset into the source the
-// caller still holds.  `line_of` and `column_of` in `xmlparse` turn it
-// into a position when a diagnostic needs one, and a caller that only
-// wants to know whether the document parsed never pays for the scan.
+// A fault carries two byte offsets into the source and nothing else.
+// `xmlparse.line_of` and `xmlparse.column_of` turn an offset into a
+// position when a diagnostic needs one, so a caller that only wants to
+// know whether a document parsed never pays for the scan.
 
 // What was wrong, named.
-//
-// A set a caller can match on rather than a string a caller has to
-// parse.  The payloads are byte ranges into the source, never copies:
-// a mismatched end tag reports WHERE both names are, and the caller
-// slices them if it is building a message.
 //
 // ```novo
 // use xmlerror
@@ -38,68 +20,71 @@
 //     println(xmlerror.kind_name(XmlBadEntity))
 // ```
 pub enum XmlFaultKind
-    // The document ended inside a construct — a tag, a comment, a
-    // CDATA section, an attribute value.
+    // The document ended inside a construct: a tag, a comment, a CDATA
+    // section, a processing instruction, an attribute value or an open
+    // element.  A document with no element at all ends this way too.
     XmlUnexpectedEnd
     // A name that is not an XML 1.0 Name: it began with a digit, a
     // hyphen or a full stop, or it holds a character the production
     // does not allow.
     XmlBadName
-    // `<` where a tag cannot start, or a tag that never reached `>`.
+    // `<` where no tag can start, a tag whose contents are not
+    // attributes and a closing `>`, or `<` inside an attribute value.
     XmlBadTag
-    // An end tag whose name is not the open element's.  XML is not
-    // HTML: this is fatal to the scanner, and it is the fault
-    // `xmltree.build` turns into an issue.
+    // An end tag whose name is not the open element's.
     XmlMismatchedEnd
-    // An end tag with nothing open.
+    // An end tag with nothing open.  `xmltree` also records this kind
+    // for an end tag that matches no open element and is dropped.
     XmlStrayEnd
     // An attribute value that was not quoted.  XML has no bare
-    // attribute values, unlike HTML.
+    // attribute values.
     XmlUnquotedAttribute
     // The same attribute name twice on one element, which XML 1.0
-    // § 3.1 forbids outright.
+    // section 3.1 forbids.
     XmlDuplicateAttribute
-    // `&name;` where `name` is not one of the five predefined
-    // entities and not a numeric reference.  A document that defines
-    // its own entities in an internal DTD subset lands here — see the
-    // README for why that is outside this package.
+    // `&name;` where `name` is not one of the five predefined entities,
+    // or an `&` that does not start a reference.  A document that
+    // defines its own entities in an internal DTD subset lands here.
     XmlBadEntity
-    // `&#...;` naming a code point outside XML 1.0's Char
-    // production: a surrogate, a non-character, or a C0 control other
-    // than tab, newline and carriage return.
+    // `&#...;` naming a code point outside XML 1.0's Char production: a
+    // surrogate, U+FFFE or U+FFFF, a C0 control other than tab, line
+    // feed and carriage return, or a number that is not one.
     XmlBadCharRef
     // `--` inside a comment, or a comment ending `--->`.
     XmlBadComment
-    // A CDATA section that never reached `]]>`, or a `]]>` in
-    // character data where no section was open.
+    // A CDATA section outside the root element, or `]]>` in character
+    // data where no section was open.
     XmlBadCData
-    // A processing instruction whose target is `xml` in any case, or
-    // one that never reached `?>`.
+    // A processing instruction whose target is `xml` in another case,
+    // or whose target is not followed by a space or `?>`.
     XmlBadProcessingInstruction
-    // An XML declaration that is not the document's first construct,
-    // or whose pseudo-attributes are not `version`, `encoding`,
-    // `standalone` in that order.
+    // An XML declaration that is not the document's first construct or
+    // is malformed, or a document type declaration after the root
+    // element or after another one.
     XmlBadDeclaration
-    // An `encoding=` naming anything but UTF-8.  A `core` package has
-    // no transcoding tables, and answering text in the wrong encoding
-    // would be worse than refusing — see the README.
+    // An `encoding=` naming anything but UTF-8.  A `Str` is UTF-8, and
+    // this package has no transcoding tables.
     XmlUnsupportedEncoding
-    // More than one element at the top level.  An XML document has
-    // exactly one root.
+    // More than one element at the top level.
     XmlMultipleRoots
-    // Content after the root element closed that is not a comment, a
+    // Content outside the root element that is not a comment, a
     // processing instruction or whitespace.
     XmlTrailingContent
-    // An `xmlns:p=` prefix used before it was declared, or used on an
-    // element outside the scope it was declared in.
+    // A namespace prefix used where no declaration of it is in scope.
     XmlUndeclaredPrefix
-    // `xmlns:xml` or `xmlns:xmlns` bound to the wrong URI, or a
-    // prefix declaration with an empty URI, which XML Namespaces 1.0
-    // permits only for the default prefix.
+    // `xmlns:xml` bound to a URI other than the XML namespace, the
+    // `xmlns` prefix declared, another prefix bound to either reserved
+    // URI, or a prefix bound to the empty string (XML Namespaces 1.0
+    // section 3).
     XmlBadNamespaceDeclaration
-    // An `XmlLimits` bound was reached: nesting, node count or
-    // attribute count.
+    // An `XmlLimits` bound was reached: nesting depth, attribute count
+    // or name length.
     XmlLimitExceeded
+    // A character XML 1.0's Char production does not allow, written
+    // directly rather than as a reference: a C0 control other than tab,
+    // line feed and carriage return, U+FFFE, U+FFFF, or bytes that are
+    // not UTF-8.
+    XmlBadChar
 
 // A fault: what, and where.
 //
@@ -112,24 +97,19 @@ pub enum XmlFaultKind
 // ```
 pub struct XmlFault
     kind: XmlFaultKind
-    // The byte offset the scanner had reached, counted from the start
-    // of the source.
+    // The byte offset where the faulty construct starts, counted from
+    // the start of the source.
     at: Int
-    // The byte offset just past the construct that was wrong, so a
-    // diagnostic can underline it.  Equal to `at` when the scanner
-    // knew where it started and not how far it ran.
+    // The byte offset just past the faulty construct, so a diagnostic
+    // can underline it.  Equal to `at` when the end is not known.
     to: Int
 
-// `XmlFault` is an `Error`, which is what lets `Result<T, XmlFault>`
-// exist at all — every fallible signature in `xmlparse` and
-// `xmlwrite` answers with one.
+// `XmlFault` is an `Error`, so a `Result` holding one is reported by
+// anything that reports errors.
 impl Error for XmlFault
-    // The one-line message: `xmlerror.message`'s sentence, the kind's
-    // name with the offset it happened at.
-    //
-    // Panics with `not implemented` until the bodies land.
+    // `xmlerror.message` of the fault.
     fn message(self) -> Str
-        todo("xml-nv.XmlFault.message")
+        message(self)
 
 // A fault from its parts.
 //
@@ -140,13 +120,12 @@ impl Error for XmlFault
 //     println(xmlerror.kind_name(xmlerror.fault(XmlBadName, 4, 9).kind))
 // ```
 pub fn fault(kind: XmlFaultKind, at: Int, to: Int) -> XmlFault []
-    todo("xml-nv.xmlerror.fault")
+    XmlFault { kind: kind, at: at, to: to }
 
 // The kind's name, in the spelling a message uses.
 //
-// Lower case with hyphens — `"bad-entity"`, `"mismatched-end"` — and
-// stable across releases, because a program's own error text and its
-// test assertions quote them.
+// Lower case with hyphens, `bad-entity` and `mismatched-end`, and
+// stable across releases, because programs quote them.
 //
 // ```novo
 // use xmlerror
@@ -155,37 +134,50 @@ pub fn fault(kind: XmlFaultKind, at: Int, to: Int) -> XmlFault []
 //     println(xmlerror.kind_name(XmlMismatchedEnd))
 // ```
 pub fn kind_name(kind: XmlFaultKind) -> Str []
-    todo("xml-nv.xmlerror.kind_name")
+    match kind
+        XmlUnexpectedEnd            => "unexpected-end"
+        XmlBadName                  => "bad-name"
+        XmlBadTag                   => "bad-tag"
+        XmlMismatchedEnd            => "mismatched-end"
+        XmlStrayEnd                 => "stray-end"
+        XmlUnquotedAttribute        => "unquoted-attribute"
+        XmlDuplicateAttribute       => "duplicate-attribute"
+        XmlBadEntity                => "bad-entity"
+        XmlBadCharRef               => "bad-char-ref"
+        XmlBadComment               => "bad-comment"
+        XmlBadCData                 => "bad-cdata"
+        XmlBadProcessingInstruction => "bad-processing-instruction"
+        XmlBadDeclaration           => "bad-declaration"
+        XmlUnsupportedEncoding      => "unsupported-encoding"
+        XmlMultipleRoots            => "multiple-roots"
+        XmlTrailingContent          => "trailing-content"
+        XmlUndeclaredPrefix         => "undeclared-prefix"
+        XmlBadNamespaceDeclaration  => "bad-namespace-declaration"
+        XmlLimitExceeded            => "limit-exceeded"
+        XmlBadChar                  => "bad-char"
 
-// One line about the fault, with its offset in it.
+// One line about the fault: the kind's name and the byte offset.
 //
-// The sentence a caller prints when it has nothing better to do with
-// the value.  It does NOT quote the source — this module never sees
-// it — so a message naming the offending name is built by the caller
-// out of the range and its own copy of the text.
+// The source is not quoted, because this module never sees it.  A
+// message naming the offending text is built by the caller from the
+// offsets and its own copy of the source.
 //
 // ```novo
 // use xmlerror
 //
 // fn main() [io]
-//     println(xmlerror.message(xmlerror.fault(XmlUnexpectedEnd, 31, 31)))
+//     println(xmlerror.message(xmlerror.fault(XmlUnexpectedEnd, 31, 31)))   // unexpected-end at byte 31
 // ```
 pub fn message(f: XmlFault) -> Str []
-    todo("xml-nv.xmlerror.message")
+    "${kind_name(f.kind)} at byte ${f.at}"
 
-// Whether the fault is one `xmltree.build` recovers from rather than
-// stops at.
+// Whether `xmltree.build` recovers from a fault of this kind rather
+// than stopping at it.
 //
 // The four are `XmlMismatchedEnd`, `XmlStrayEnd`, `XmlUnexpectedEnd`
 // and `XmlUndeclaredPrefix`: a tree can be built past each of them by
-// closing, dropping or leaving unresolved. Everything else — a
-// malformed entity, an unquoted attribute, a bad declaration — leaves
-// the scanner with no way to say what the next event even is, so the
-// tolerant build stops there too.
-//
-// It is public because it is the rule that decides which half of this
-// package a caller is in, and a reader should not have to infer it
-// from behaviour.
+// closing, dropping or leaving a name unresolved.  After any other
+// fault the scanner cannot say what the next event is.
 //
 // ```novo
 // use xmlerror
@@ -194,4 +186,9 @@ pub fn message(f: XmlFault) -> Str []
 //     println("${xmlerror.is_recoverable(XmlStrayEnd)}")
 // ```
 pub fn is_recoverable(kind: XmlFaultKind) -> Bool []
-    todo("xml-nv.xmlerror.is_recoverable")
+    match kind
+        XmlMismatchedEnd    => true
+        XmlStrayEnd         => true
+        XmlUnexpectedEnd    => true
+        XmlUndeclaredPrefix => true
+        _                   => false
