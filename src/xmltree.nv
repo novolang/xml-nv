@@ -416,26 +416,23 @@ fn run(start: xmlparse.XmlScanner, strict: Bool) -> (XmlDocument, ?xmlerror.XmlF
     var stopped: ?xmlerror.XmlFault = None
     var end = n
     var truncated = false
-    var going = true
     for _ in 0..n + 2
-        if not going
-            break
         match xmlparse.next_event(s)
             Ok(step) =>
                 if list.len(b.stack) == 0 and is_end_tag(step.event)
                     end = step.event.span.start
-                    going = false
+                    break
                 else
                     match step.event.kind
                         XmlEof =>
                             end = step.event.span.end
-                            going = false
+                            break
                         _      =>
                             if let Some(f) = event(b, source, step.event, strict)
                                 list.push(b.issues, XmlIssue { at: f.at, kind: f.kind })
                                 stopped = Some(f)
                                 end = f.at
-                                going = false
+                                break
                             s = step.scanner
             Err(f)   =>
                 var kind = f.kind
@@ -451,10 +448,10 @@ fn run(start: xmlparse.XmlScanner, strict: Bool) -> (XmlDocument, ?xmlerror.XmlF
                     stopped = Some(xmlerror.fault(kind, f.at, f.to))
                     truncated = kind == XmlLimitExceeded
                     end = f.at
-                    going = false
+                    break
                 else if kind == XmlUnexpectedEnd
                     end = n
-                    going = false
+                    break
                 else
                     for k in 0..pop
                         var to = f.at
