@@ -1,0 +1,234 @@
+// xmlwrite_tests.nv — the writer: the escaping rules, the refusals,
+// the three option sets, and round trips.
+//
+// The round trip that matters most is `preserve`: building a tree and
+// writing it back must give the source, byte for byte, so that a tool
+// changing one element of a person's file produces a diff of that
+// element only.  Every well-formed document of the W3C suite is written
+// back that way in conformance_tests.nv.
+
+use std.test
+use std.list
+use xmltree
+use xmlwrite
+
+// A buffer as the text it holds.
+fn text(out: [u8]) -> Str
+    var s = ""
+    for b in out
+        s = s + str.from_byte(b as Int)
+    s
+
+// A document written with some options.
+fn written(source: Str, o: XmlWriteOptions) -> Str
+    xmlwrite.serialize_str(xmltree.build(source), o)
+
+@test
+fn test_the_escaping_rules() [io]
+    test.case("character data: &, <, > and a carriage return")
+    test.assert(text(xmlwrite.write_text([], "a < b & c > d\r")) == "a &lt; b &amp; c &gt; d&#13;")
+    test.assert(text(xmlwrite.write_text([], "\"quotes\" and 'these' stay")) == "\"quotes\" and 'these' stay")
+
+    test.case("an attribute value: the delimiting quote, and whitespace that would be normalised")
+    test.assert(text(xmlwrite.write_attr_value([], "a\"b'c", 34)) == "a&quot;b'c")
+    test.assert(text(xmlwrite.write_attr_value([], "a\"b'c", 39)) == "a\"b&apos;c")
+    test.assert(text(xmlwrite.write_attr_value([], "<&>\t\n\r", 34)) == "&lt;&amp;>&#9;&#10;&#13;")
+    test.assert(text(xmlwrite.write_attr_value([], "\"'\t", 0)) == "\"'&#9;")
+
+    test.case("a character XML has no spelling for becomes U+FFFD")
+    test.assert(text(xmlwrite.write_text([], "a\u{1}b\xffc")) == "a\u{fffd}b\u{fffd}c")
+    test.assert(text(xmlwrite.write_text([], "\xe0\x80\xaf")) == "\u{fffd}\u{fffd}\u{fffd}")
+    test.assert(text(xmlwrite.write_text([], "\xf0\x80\x80\x80\xc3")) == "\u{fffd}\u{fffd}\u{fffd}\u{fffd}\u{fffd}")
+    test.assert(text(xmlwrite.write_text([], "é日😀")) == "é日😀")
+
+    test.case("tabs and line feeds are text, and U+FFFE is not a character")
+    test.assert(text(xmlwrite.write_text([], "a\tb\n\u{fffe}")) == "a\tb\n\u{fffd}")
+
+    test.case("escape_overhead is what the escaping adds")
+    test.assert(xmlwrite.escape_overhead("plain") == 0)
+    test.assert(xmlwrite.escape_overhead("a<b") == 3)
+    test.assert(xmlwrite.escape_overhead("\u{1}") == 2)
+
+    test.case("the buffer is appended to, not replaced")
+    var out: [u8] = []
+    out = xmlwrite.write_text(out, "a")
+    xmlwrite.write_text(out, "b")
+    test.assert(text(out) == "ab")
+
+@test
+fn test_every_constructor_refuses_what_it_cannot_write() [io]
+    test.case("tags with attributes, escaped, in the options' quote")
+    let attrs = [XmlWriteAttr { name: "id", value: "a&b" }, XmlWriteAttr { name: "t", value: "it's" }]
+    match xmlwrite.write_start_tag([], "item", attrs, xmlwrite.canonical())
+        Ok(out) => test.assert(text(out) == "<item id=\"a&amp;b\" t=\"it's\">")
+        Err(_)  => test.assert(false)
+    var single = xmlwrite.canonical()
+    single = XmlWriteOptions { indent: 0, self_close_empty: true, declaration: false, quote: 39,
+                               preserve_shape: false }
+    match xmlwrite.write_empty_tag([], "item", attrs, single)
+        Ok(out) => test.assert(text(out) == "<item id='a&amp;b' t='it&apos;s'/>")
+        Err(_)  => test.assert(false)
+
+    test.case("a name that is not a Name, in a tag or an attribute")
+    match xmlwrite.write_empty_tag([], "a b", [], xmlwrite.canonical())
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(f.kind == XmlBadName)
+    match xmlwrite.write_start_tag([], "a", [XmlWriteAttr { name: "1x", value: "" }], xmlwrite.canonical())
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(f.kind == XmlBadName)
+    match xmlwrite.write_end_tag([], "<a>")
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(f.kind == XmlBadName)
+
+    test.case("the same attribute twice")
+    let twice = [XmlWriteAttr { name: "k", value: "1" }, XmlWriteAttr { name: "k", value: "2" }]
+    match xmlwrite.write_start_tag([], "a", twice, xmlwrite.canonical())
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(f.kind == XmlDuplicateAttribute)
+
+    test.case("a CDATA section, a comment and an instruction that would break")
+    match xmlwrite.write_cdata([], "ok")
+        Ok(out) => test.assert(text(out) == "<![CDATA[ok]]>")
+        Err(_)  => test.assert(false)
+    match xmlwrite.write_cdata([], "a\u{1}")
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            test.assert(f.kind == XmlBadChar)
+            test.assert(f.at == 1)
+    match xmlwrite.write_comment([], "trailing-")
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(f.kind == XmlBadComment)
+    match xmlwrite.write_comment([], "\u{b}")
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(f.kind == XmlBadChar)
+    match xmlwrite.write_comment([], " fine ")
+        Ok(out) => test.assert(text(out) == "<!-- fine -->")
+        Err(_)  => test.assert(false)
+    match xmlwrite.write_pi([], "t", "a ?> b")
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(f.kind == XmlBadProcessingInstruction)
+    match xmlwrite.write_pi([], "t t", "")
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(f.kind == XmlBadName)
+    match xmlwrite.write_pi([], "t", "\u{1}")
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(f.kind == XmlBadChar)
+    match xmlwrite.write_pi([], "t", "")
+        Ok(out) => test.assert(text(out) == "<?t?>")
+        Err(_)  => test.assert(false)
+    match xmlwrite.write_pi([], "xml-stylesheet", "href=\"s.xsl\"")
+        Ok(out) => test.assert(text(out) == "<?xml-stylesheet href=\"s.xsl\"?>")
+        Err(_)  => test.assert(false)
+
+    test.case("the declaration, with and without standalone")
+    test.assert(text(xmlwrite.write_declaration([], None)) == "<?xml version=\"1.0\" encoding=\"UTF-8\"?>")
+    test.assert(text(xmlwrite.write_declaration([], Some(false)))
+                == "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>")
+
+@test
+fn test_the_canonical_form() [io]
+    test.case("references are resolved, values re-escaped, CDATA written as text")
+    let src = "<a  x='&#65;&amp;' y=\"t\u{9}u\"><![CDATA[<b>]]>&#x42;<!--c--><?p d?><?q?></a>"
+    test.assert(written(src, xmlwrite.canonical())
+                == "<a x=\"A&amp;\" y=\"t u\">&lt;b&gt;B<!--c--><?p d?><?q?></a>")
+
+    test.case("empty elements, with and without self-closing")
+    test.assert(written("<a><b></b></a>", xmlwrite.canonical()) == "<a><b/></a>")
+    let open = XmlWriteOptions { indent: 0, self_close_empty: false, declaration: false, quote: 34,
+                                 preserve_shape: false }
+    test.assert(written("<a><b/></a>", open) == "<a><b></b></a>")
+
+    test.case("a doctype is kept, top-level whitespace is not, and a declaration is added on request")
+    let top = "<!DOCTYPE a>\n<!--x-->\n<a/>\n"
+    test.assert(written(top, xmlwrite.canonical()) == "<!DOCTYPE a><!--x--><a/>")
+    let decl = XmlWriteOptions { indent: 0, self_close_empty: true, declaration: true, quote: 34,
+                                 preserve_shape: false }
+    test.assert(written("<a/>", decl) == "<?xml version=\"1.0\" encoding=\"UTF-8\"?><a/>")
+
+@test
+fn test_pretty_printing() [io]
+    test.case("element-only content is indented, and its whitespace replaced")
+    let src = "<a>\n <b><c/></b>\n <!--n-->\n</a>"
+    let want = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<a>\n  <b>\n    <c/>\n  </b>\n  <!--n-->\n</a>"
+    test.assert(written(src, xmlwrite.pretty()) == want)
+
+    test.case("an element holding text keeps every byte of its content")
+    let mixed = "<a><p>x <b>y</b> z</p></a>"
+    test.assert(written(mixed, xmlwrite.pretty())
+                == "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<a>\n  <p>x <b>y</b> z</p>\n</a>")
+
+    test.case("a CDATA section is text, so its element is written as it is")
+    test.assert(written("<a><b><![CDATA[x]]></b></a>", xmlwrite.pretty())
+                == "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<a>\n  <b>x</b>\n</a>")
+
+    test.case("top-level nodes each take a line")
+    test.assert(written("<!--c--><a/>", xmlwrite.pretty())
+                == "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!--c-->\n<a/>")
+
+    test.case("an element with only whitespace inside is empty when indented")
+    test.assert(written("<a>  </a>", xmlwrite.pretty()) == "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<a/>")
+
+@test
+fn test_preserve_writes_back_what_was_there() [io]
+    test.case("a document with a declaration, odd spacing and references")
+    let src = "<?xml version='1.0'?>\r\n<!DOCTYPE a [<!ENTITY e 'x'>]>\n<a  b = 'c&amp;' >\n <x/><![CDATA[&]]>&#65;<!--k--><?p?></a >\n"
+    test.assert(written(src, xmlwrite.preserve()) == src)
+
+    test.case("a declaration is added only to a source that had none")
+    let decl = XmlWriteOptions { indent: 0, self_close_empty: true, declaration: true, quote: 34,
+                                 preserve_shape: true }
+    test.assert(written("<a/>", decl) == "<?xml version=\"1.0\" encoding=\"UTF-8\"?><a/>")
+    test.assert(written("<?xml version=\"1.0\"?><a/>", decl) == "<?xml version=\"1.0\"?><a/>")
+
+    test.case("an element whose end tag a repair supplied gets one written")
+    test.assert(written("<a><b>t", xmlwrite.preserve()) == "<a><b>t</b></a>")
+    test.assert(written("<a><b></a>", xmlwrite.preserve()) == "<a><b></b></a>")
+
+    test.case("an empty tree writes nothing")
+    test.assert(written("", xmlwrite.preserve()) == "")
+
+@test
+fn test_one_node_and_one_node_s_children() [io]
+    let doc = xmltree.build("<a><b x=\"1\">t</b><c/></a>")
+
+    test.case("a node alone, in each option set")
+    test.assert(text(xmlwrite.serialize_node([], doc, 2, xmlwrite.canonical())) == "<b x=\"1\">t</b>")
+    test.assert(text(xmlwrite.serialize_node([], doc, 2, xmlwrite.preserve())) == "<b x=\"1\">t</b>")
+    test.assert(text(xmlwrite.serialize_node([], doc, 3, xmlwrite.canonical())) == "t")
+    test.assert(text(xmlwrite.serialize_node([], doc, 0, xmlwrite.canonical())) == "<a><b x=\"1\">t</b><c/></a>")
+    test.assert(text(xmlwrite.serialize_node([], doc, 0, xmlwrite.preserve())) == "<a><b x=\"1\">t</b><c/></a>")
+
+    test.case("an index that names nothing writes nothing")
+    test.assert(list.len(xmlwrite.serialize_node([], doc, 99, xmlwrite.canonical())) == 0)
+    test.assert(list.len(xmlwrite.serialize_node([], doc, 0 - 1, xmlwrite.canonical())) == 0)
+
+    test.case("the children alone, flat or one to a line")
+    test.assert(text(xmlwrite.serialize_children([], doc, 1, xmlwrite.canonical())) == "<b x=\"1\">t</b><c/>")
+    let indented = xmlwrite.serialize_children([], doc, 1, xmlwrite.pretty())
+    test.assert(text(indented) == "<b x=\"1\">t</b>\n<c/>")
+
+    test.case("serialize appends a whole document to a buffer")
+    test.assert(text(xmlwrite.serialize([], doc, xmlwrite.canonical())) == "<a><b x=\"1\">t</b><c/></a>")
+
+@test
+fn test_a_hand_built_tree_that_does_not_decode() [io]
+    // A tree built from a source always decodes, because the scanner
+    // checked every reference.  A tree whose source was swapped for one
+    // of the same length with a reference that does not exist is the
+    // one way to reach the fallback, which writes the bytes.
+    let good = xmltree.build("<a b=\"&amp;\">&amp;</a>")
+    let bad = XmlDocument { source: "<a b=\"&bad;\">&bad;</a>", nodes: good.nodes, namespaces: good.namespaces,
+                            issues: good.issues, truncated: good.truncated }
+    test.case("the writer writes the bytes it has")
+    test.assert(xmlwrite.serialize_str(bad, xmlwrite.canonical()) == "<a b=\"&amp;bad;\">&amp;bad;</a>")
+    test.case("and the tree's getters answer what they can")
+    test.assert(xmltree.attr(bad, 1, "b") == None)
+    test.assert(xmltree.text_of(bad, 2) == "&bad;")
+
+@test
+fn test_preserve_is_the_identity_on_well_formed_documents() [io]
+    test.case("every construct at once")
+    for src in ["<a/>", "<a></a>", "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?><!--c--><a/>",
+                "<a xmlns:p=\"urn:p\"><p:b p:x='&quot;'/>\n\t<![CDATA[]]]]></a>",
+                "\u{feff}<a>&#x10000;</a>"]
+        test.assert(written(src, xmlwrite.preserve()) == src)

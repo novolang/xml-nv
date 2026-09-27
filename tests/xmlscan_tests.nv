@@ -1,0 +1,356 @@
+// xmlscan_tests.nv — the scanner's refusals, one construct at a time,
+// and the helpers around it.
+//
+// XML 1.0 names a well-formedness constraint for each construct, and
+// each case here breaks one and checks the fault's kind and, where the
+// place matters, its offset.  The cases the W3C suite already covers
+// are in conformance_tests.nv; these are the ones a reader of the
+// scanner would ask about next.
+
+use std.test
+use std.list
+use xmlparse
+use xmlerror
+
+// The fault a document stops at, or `None` when it scans to the end.
+fn fault(source: Str) -> ?xmlerror.XmlFault
+    var s = xmlparse.scanner(source)
+    for _ in 0..str.len(source) + 2
+        match xmlparse.next_event(s)
+            Err(f)   =>
+                return Some(f)
+            Ok(step) =>
+                match step.event.kind
+                    XmlEof =>
+                        return None
+                    _      =>
+                        s = step.scanner
+    None
+
+// The kind of `fault`, for a case that only cares about the kind.
+fn kind(source: Str) -> ?xmlerror.XmlFaultKind
+    match fault(source)
+        Some(f) => Some(f.kind)
+        None    => None
+
+// The offset of `fault`, or -1.
+fn at(source: Str) -> Int
+    match fault(source)
+        Some(f) => f.at
+        None    => 0 - 1
+
+// Every event kind's name, in order, for a document that scans.
+fn shapes(source: Str) -> [Str]
+    var s = xmlparse.scanner(source)
+    var out: [Str] = []
+    for _ in 0..str.len(source) + 2
+        match xmlparse.next_event(s)
+            Err(_)   =>
+                list.push(out, "fault")
+                return out
+            Ok(step) =>
+                s = step.scanner
+                match step.event.kind
+                    XmlStartTag(_, _)              => list.push(out, "start")
+                    XmlEndTag(_)                   => list.push(out, "end")
+                    XmlEmptyTag(_, _)              => list.push(out, "empty")
+                    XmlText(_, _)                  => list.push(out, "text")
+                    XmlCData(_)                    => list.push(out, "cdata")
+                    XmlComment(_)                  => list.push(out, "comment")
+                    XmlProcessingInstruction(_, _) => list.push(out, "pi")
+                    XmlDeclaration(_, _, _)        => list.push(out, "decl")
+                    XmlDoctype(_)                  => list.push(out, "doctype")
+                    XmlEof                         =>
+                        list.push(out, "eof")
+                        return out
+    out
+
+@test
+fn test_the_prolog_and_the_epilog() [io]
+    test.case("the declaration, a doctype, comments, instructions and whitespace around the root")
+    let doc = "<?xml version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\"?>\n<!DOCTYPE d>\n<!--c--><?p?><d/>\n<!--e-->"
+    test.assert(shapes(doc) == ["decl", "text", "doctype", "text", "comment", "pi", "empty", "text", "comment",
+                                "eof"])
+
+    test.case("a byte order mark is skipped, and the declaration may follow it")
+    test.assert(shapes("\u{feff}<?xml version=\"1.0\"?><d/>") == ["decl", "empty", "eof"])
+
+    test.case("the declaration's values are ranges, empty when absent")
+    let d = "<?xml version='1.1'?><d/>"
+    match xmlparse.next_event(xmlparse.scanner(d))
+        Ok(step) =>
+            match step.event.kind
+                XmlDeclaration(v, e, sa) =>
+                    test.assert(xmlparse.text_at(step.scanner, v) == "1.1")
+                    test.assert(e.end == e.start)
+                    test.assert(sa.end == sa.start)
+                _                        => test.assert(false)
+        Err(_)   => test.assert(false)
+
+    test.case("an internal subset may hold > in literals, comments and instructions")
+    let subset = "<!DOCTYPE d [<!ENTITY e \"a>b\"><!-- x > y --><?p a > b?><!ATTLIST d a CDATA 'q>'>]><d/>"
+    test.assert(shapes(subset) == ["doctype", "empty", "eof"])
+
+    test.case("after the root element nothing but comments, instructions and whitespace")
+    test.assert(kind("<d/>x") == Some(XmlTrailingContent))
+    test.assert(kind("x<d/>") == Some(XmlTrailingContent))
+    test.assert(kind("<d/>&amp;") == Some(XmlTrailingContent))
+    test.assert(kind("<d/><![CDATA[x]]>") == Some(XmlBadCData))
+    test.assert(kind("<d/><e/>") == Some(XmlMultipleRoots))
+
+    test.case("a document with no element ends too early")
+    test.assert(kind("") == Some(XmlUnexpectedEnd))
+    test.assert(kind("<!-- only -->") == Some(XmlUnexpectedEnd))
+
+@test
+fn test_the_declaration_is_checked_to_section_2_8() [io]
+    test.case("it must come first")
+    test.assert(kind(" <?xml version=\"1.0\"?><d/>") == Some(XmlBadDeclaration))
+    test.assert(kind("<d><?xml version=\"1.0\"?></d>") == Some(XmlBadDeclaration))
+
+    test.case("version is required, and is 1. and digits")
+    test.assert(kind("<?xml?><d/>") == Some(XmlBadDeclaration))
+    test.assert(kind("<?xml encoding=\"UTF-8\"?><d/>") == Some(XmlBadDeclaration))
+    test.assert(kind("<?xml version=\"2.0\"?><d/>") == Some(XmlBadDeclaration))
+    test.assert(kind("<?xml version=\"1.x\"?><d/>") == Some(XmlBadDeclaration))
+    test.assert(kind("<?xml version \"1.0\"?><d/>") == Some(XmlBadDeclaration))
+    test.assert(kind("<?xml version=1.0?><d/>") == Some(XmlBadDeclaration))
+    test.assert(kind("<?xml version=\"1.0") == Some(XmlUnexpectedEnd))
+
+    test.case("the three pseudo-attributes come in order, and standalone is yes or no")
+    test.assert(kind("<?xml version=\"1.0\" standalone=\"yes\" encoding=\"UTF-8\"?><d/>")
+                == Some(XmlBadDeclaration))
+    test.assert(kind("<?xml version=\"1.0\" standalone=\"maybe\"?><d/>") == Some(XmlBadDeclaration))
+    test.assert(kind("<?xml version=\"1.0\" encoding \"UTF-8\"?><d/>") == Some(XmlBadDeclaration))
+    test.assert(kind("<?xml version=\"1.0\" standalone=yes?><d/>") == Some(XmlBadDeclaration))
+    test.assert(kind("<?xml version=\"1.0\" encoding=\"UTF-8\"") == Some(XmlUnexpectedEnd))
+
+    test.case("an encoding other than UTF-8 is refused, whatever its case")
+    test.assert(kind("<?xml version=\"1.0\" encoding=\"Utf-8\"?><d/>") == None)
+    test.assert(kind("<?xml version=\"1.0\" encoding=\"UTF-16\"?><d/>") == Some(XmlUnsupportedEncoding))
+
+    test.case("a target of xml in another case is a reserved name misused")
+    test.assert(kind("<d><?XML x?></d>") == Some(XmlBadProcessingInstruction))
+
+@test
+fn test_the_doctype_is_placed_and_closed() [io]
+    test.case("once, before the root")
+    test.assert(kind("<!DOCTYPE a><!DOCTYPE a><a/>") == Some(XmlBadDeclaration))
+    test.assert(kind("<a/><!DOCTYPE a>") == Some(XmlBadDeclaration))
+    test.assert(kind("<a><!DOCTYPE a></a>") == Some(XmlBadDeclaration))
+
+    test.case("with whitespace after the keyword")
+    test.assert(kind("<!DOCTYPEa><a/>") == Some(XmlBadDeclaration))
+    test.assert(kind("<!DOCTYPE") == Some(XmlUnexpectedEnd))
+
+    test.case("and closed")
+    test.assert(kind("<!DOCTYPE a [") == Some(XmlUnexpectedEnd))
+    test.assert(kind("<!DOCTYPE a \"unclosed") == Some(XmlUnexpectedEnd))
+    test.assert(kind("<!DOCTYPE a [<!-- open") == Some(XmlUnexpectedEnd))
+    test.assert(kind("<!DOCTYPE a [<?p open") == Some(XmlUnexpectedEnd))
+
+@test
+fn test_tags_and_attributes() [io]
+    test.case("a tag's shape")
+    test.assert(kind("< a/>") == Some(XmlBadTag))
+    test.assert(kind("<1a/>") == Some(XmlBadName))
+    test.assert(kind("<a b/>") == Some(XmlBadTag))
+    test.assert(kind("<a b =  \"1\"c=\"2\"/>") == Some(XmlBadTag))
+    test.assert(kind("<a/ >") == Some(XmlBadTag))
+    test.assert(kind("<a/") == Some(XmlUnexpectedEnd))
+    test.assert(kind("<a") == Some(XmlUnexpectedEnd))
+    test.assert(kind("<a b") == Some(XmlUnexpectedEnd))
+    test.assert(kind("<a b=") == Some(XmlUnexpectedEnd))
+    test.assert(kind("<a b=\"1") == Some(XmlUnexpectedEnd))
+    test.assert(kind("<") == Some(XmlUnexpectedEnd))
+    test.assert(kind("<a></a") == Some(XmlUnexpectedEnd))
+    test.assert(kind("<a></a x>") == Some(XmlBadTag))
+    test.assert(kind("<a></ a>") == Some(XmlBadTag))
+    test.assert(kind("<a><!x></a>") == Some(XmlBadTag))
+    test.assert(kind("<a><!") == Some(XmlUnexpectedEnd))
+
+    test.case("an attribute value may not hold <, and its references are checked")
+    test.assert(kind("<a b=\"<\"/>") == Some(XmlBadTag))
+    test.assert(kind("<a b=\"&nope;\"/>") == Some(XmlBadEntity))
+    test.assert(kind("<a b=\"&#1;\"/>") == Some(XmlBadCharRef))
+    test.assert(kind("<a b='\u{1}'/>") == Some(XmlBadChar))
+
+    test.case("either quote may delimit a value, and the other may appear inside")
+    match xmlparse.next_event(xmlparse.scanner("<a b='say \"hi\"' c=\"it's\"/>"))
+        Ok(step) =>
+            match step.event.kind
+                XmlEmptyTag(_, attrs) =>
+                    test.assert(list.len(attrs) == 2)
+                    test.assert(attrs[0].quote == 39)
+                    test.assert(attrs[1].quote == 34)
+                    test.assert(xmlparse.text_at(step.scanner, attrs[0].value) == "say \"hi\"")
+                    test.assert(attrs[0].needs_decoding == false)
+                _                     => test.assert(false)
+        Err(_)   => test.assert(false)
+
+    test.case("the offsets of a fault underline the construct")
+    match fault("<doc></dOc>")
+        Some(f) =>
+            test.assert(f.at == 5)
+            test.assert(f.to == 11)
+        None    => test.assert(false)
+    test.assert(at("<a b=\"1\" b=\"2\"/>") == 9)
+
+@test
+fn test_comments_cdata_and_instructions() [io]
+    test.case("a comment may hold a single hyphen, but not two, nor end with one")
+    test.assert(kind("<a><!-- a-b --></a>") == None)
+    test.assert(kind("<a><!-- a ---></a>") == Some(XmlBadComment))
+    test.assert(kind("<a><!-- a -") == Some(XmlUnexpectedEnd))
+    test.assert(kind("<a><!-- a --") == Some(XmlUnexpectedEnd))
+
+    test.case("a CDATA section is closed, and ]]> in text is refused")
+    test.assert(kind("<a><![CDATA[x") == Some(XmlUnexpectedEnd))
+    test.assert(kind("<a>x]]>y</a>") == Some(XmlBadCData))
+    test.assert(kind("<a>x]]y]>z</a>") == None)
+
+    test.case("an instruction's target is a name followed by a space or ?>")
+    test.assert(shapes("<a><?t?></a>") == ["start", "pi", "end", "eof"])
+    test.assert(kind("<a><?t-x?></a>") == None)
+    test.assert(kind("<a><?t \u{1}?></a>") == Some(XmlBadChar))
+    test.assert(kind("<a><?t=?></a>") == Some(XmlBadProcessingInstruction))
+    test.assert(kind("<a><? t?></a>") == Some(XmlBadProcessingInstruction))
+    test.assert(kind("<a><?t") == Some(XmlUnexpectedEnd))
+    test.assert(kind("<a><?t data") == Some(XmlUnexpectedEnd))
+
+@test
+fn test_characters_and_names() [io]
+    test.case("a character outside the Char production, written directly, is refused")
+    test.assert(kind("<a>\u{1}</a>") == Some(XmlBadChar))
+    test.assert(kind("<a>\u{fffe}</a>") == Some(XmlBadChar))
+    test.assert(kind("<a><!--\u{b}--></a>") == Some(XmlBadChar))
+    test.assert(kind("<a><![CDATA[\u{1f}]]></a>") == Some(XmlBadChar))
+
+    test.case("and so are bytes that are not UTF-8")
+    test.assert(kind("<a>\xff</a>") == Some(XmlBadChar))
+    test.assert(kind("<a>\xc3</a>") == Some(XmlBadChar))
+    test.assert(kind("<a>\xc0\xaf</a>") == Some(XmlBadChar))
+    test.assert(kind("<a>\xe0\x80\xaf</a>") == Some(XmlBadChar))
+    test.assert(kind("<a>\xed\xa0\x80</a>") == Some(XmlBadChar))
+    test.assert(kind("<a>\xf4\x90\x80\x80</a>") == Some(XmlBadChar))
+    test.assert(kind("<a>\xf8\x88\x80\x80</a>") == Some(XmlBadChar))
+
+    test.case("text in any script, and names in the ranges section 2.3 lists")
+    test.assert(kind("<a>héllo 日本 😀</a>") == None)
+    for name in ["é", "ñame", "Ωmega", "日本", "x·y", "a\u{300}", "\u{2070}", "\u{2c00}", "\u{3001}",
+                 "\u{f900}", "\u{fdf0}", "\u{10000}", "\u{37f}", "\u{200c}x", "x\u{203f}"]
+        test.assert(xmlparse.is_name(name))
+    for bad in ["\u{d7}", "\u{2000}", "·x", "\u{300}a", "\u{f0000}", "a b", "\u{37e}"]
+        test.assert(xmlparse.is_name(bad) == false)
+    test.assert(xmlparse.is_xml_char(1114112) == false)
+    test.assert(xmlparse.is_xml_char(65534) == false)
+    test.assert(xmlparse.is_xml_char(65536))
+
+@test
+fn test_references() [io]
+    test.case("an ampersand that starts no reference, and references that are not closed")
+    test.assert(kind("<a>&</a>") == Some(XmlBadEntity))
+    test.assert(kind("<a>&amp</a>") == Some(XmlBadEntity))
+    test.assert(kind("<a>&#65</a>") == Some(XmlBadCharRef))
+    test.assert(kind("<a>&#;</a>") == Some(XmlBadCharRef))
+    test.assert(kind("<a>&#x;</a>") == Some(XmlBadCharRef))
+    test.assert(kind("<a>&#xZZ;</a>") == Some(XmlBadCharRef))
+    test.assert(kind("<a>&#99999999999999999999;</a>") == Some(XmlBadCharRef))
+    test.assert(kind("<a>&#xD800;</a>") == Some(XmlBadCharRef))
+
+    test.case("decode expands references and normalises line ends")
+    let s = xmlparse.scanner("<a>&lt;&#x1F600;&#128512;\r\nx\ry</a>")
+    match xmlparse.decode(s, XmlRange { start: 3, end: 30 })
+        Ok(t)  => test.assert(t == "<😀😀\nx\ny")
+        Err(_) => test.assert(false)
+
+    test.case("and answers the fault for a range the scanner never checked")
+    match xmlparse.decode(xmlparse.scanner("x&bad;"), XmlRange { start: 0, end: 6 })
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            test.assert(f.kind == XmlBadEntity)
+            test.assert(f.at == 1)
+
+    test.case("an attribute value's whitespace becomes spaces, but a reference to it does not")
+    let a = xmlparse.scanner("x\ty\r\nz&#10;&#9;")
+    match xmlparse.decode_attr(a, XmlRange { start: 0, end: 16 })
+        Ok(t)  => test.assert(t == "x y z\n\t")
+        Err(_) => test.assert(false)
+    match xmlparse.decode_attr(xmlparse.scanner("&x;"), XmlRange { start: 0, end: 3 })
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(f.kind == XmlBadEntity)
+
+    test.case("text holding a carriage return is flagged, because its text differs from its bytes")
+    match xmlparse.next_event(xmlparse.scanner("<a>x\ry</a>"))
+        Ok(first) =>
+            match xmlparse.next_event(first.scanner)
+                Ok(second) =>
+                    match second.event.kind
+                        XmlText(_, needs) => test.assert(needs)
+                        _                 => test.assert(false)
+                Err(_)     => test.assert(false)
+        Err(_)    => test.assert(false)
+
+@test
+fn test_limits_bound_depth_attributes_and_names() [io]
+    let tight = XmlLimits { max_depth: 2, max_attributes: 1, max_name_length: 4 }
+
+    test.case("nesting past the bound")
+    var s = xmlparse.scanner_with("<a><b><c/></b></a>", tight)
+    var got: ?xmlerror.XmlFaultKind = None
+    for _ in 0..6
+        match xmlparse.next_event(s)
+            Ok(step) =>
+                s = step.scanner
+            Err(f)   =>
+                if got == None
+                    got = Some(f.kind)
+    test.assert(got == Some(XmlLimitExceeded))
+
+    test.case("attributes past the bound")
+    match xmlparse.next_event(xmlparse.scanner_with("<a x=\"1\" y=\"2\"/>", tight))
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(f.kind == XmlLimitExceeded)
+
+    test.case("a name past the bound")
+    match xmlparse.next_event(xmlparse.scanner_with("<abcde/>", tight))
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(f.kind == XmlLimitExceeded)
+
+@test
+fn test_positions_and_the_scanner_itself() [io]
+    test.case("line and column count from 1, a column in bytes")
+    let p = xmlparse.scanner("<a>\n  <b/>\n</a>")
+    test.assert(xmlparse.line_of(p, 6) == 2)
+    test.assert(xmlparse.column_of(p, 6) == 3)
+    test.assert(xmlparse.line_of(p, 99) == 3)
+
+    test.case("the scanner passed in is unchanged, so a caller can look ahead")
+    let s = xmlparse.scanner("<a><b/></a>")
+    match xmlparse.next_event(s)
+        Ok(step) =>
+            test.assert(s.at == 0)
+            test.assert(xmlparse.depth(s) == 0)
+            test.assert(xmlparse.depth(step.scanner) == 1)
+            match xmlparse.next_event(step.scanner)
+                Ok(inner) =>
+                    test.assert(xmlparse.depth(inner.scanner) == 1)
+                    test.assert(xmlparse.depth(step.scanner) == 1)
+                Err(_)    => test.assert(false)
+        Err(_)   => test.assert(false)
+
+    test.case("after the end the scanner keeps answering the end")
+    match xmlparse.next_event(xmlparse.scanner("<a/>"))
+        Ok(one) =>
+            match xmlparse.next_event(one.scanner)
+                Ok(two) =>
+                    match xmlparse.next_event(two.scanner)
+                        Ok(three) => test.assert(three.event.span.start == 4)
+                        Err(_)    => test.assert(false)
+                Err(_)  => test.assert(false)
+        Err(_)  => test.assert(false)
+
+    test.case("the predefined entities are five")
+    test.assert(xmlparse.PREDEFINED_ENTITIES == 5)
+    test.assert(xmlerror.message(xmlerror.fault(XmlBadName, 3, 4)) == "bad-name at byte 3")
+    test.assert(xmlerror.fault(XmlBadName, 3, 4).message() == "bad-name at byte 3")

@@ -1,26 +1,15 @@
-// xmltree_tests.nv — the API suite for the tolerant tree, the finds
-// over it, and the writer back out of it.
+// xmltree_tests.nv — the tolerant tree, the finds over it, and the
+// writer back out of it.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: xml-nv.<module>.<fn>`.
-//
-// THE TREE CASES ARE THE FOUR RECOVERIES.  `build` is tolerant of
-// exactly what `xmlerror.is_recoverable` names and of nothing else,
-// and the tests that keep that honest are the ones asserting that a
-// document with a mismatched end tag produces a TREE AND AN ISSUE —
-// not a tree, and not a fault.
-//
-// THE FIND CASES ARE ElementTree's OWN documented examples, from the
-// `xml.etree.ElementTree` tutorial's country-data document, because
-// they are the ones a reader coming from Python will try first.
-//
-// THE WRITER CASES ARE THE THREE ESCAPING RULES: character data,
-// attribute values, and the two constructs that have no escape at all.
+// The tree cases are the four repairs: a document with a mismatched
+// end tag produces a tree and an issue, not a fault.  The find cases
+// are ElementTree's own tutorial examples, from the
+// `xml.etree.ElementTree` documentation's country-data document.  The
+// writer cases are its escaping rules.
 
 use std.test
 use std.list
 use xmlparse
-use xmlerror
 use xmltree
 use xmlfind
 use xmlwrite

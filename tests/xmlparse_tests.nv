@@ -1,22 +1,10 @@
-// xmlparse_tests.nv — the API suite for the pull parser.
+// xmlparse_tests.nv — the pull parser's events and refusals.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: xml-nv.xmlparse.<fn>`.
-//
-// THE CASES ARE THE W3C XML CONFORMANCE SUITE'S OWN SHAPE.  That suite
-// — `xmlconf`, the `valid/sa`, `not-wf/sa` and `oasis` collections — is
-// a list of documents each marked as well-formed or not, and it is the
-// oracle every XML parser is measured against.  The documents below
-// are quoted from it or reduced from it, and the whole suite becomes a
-// generated run beside this one when the implementation lands: a
-// `valid` case has to scan to `XmlEof` and a `not-wf` case has to
-// answer a fault, and nothing in between is a pass.
-//
-// WHAT IS DELIBERATELY NOT HERE: the `valid` cases whose validity
-// depends on a DTD.  This package does not read one, so a document
-// that is well-formed and invalid is, to it, a document — and the
-// suite's `invalid` collection is not an oracle for a non-validating
-// parser.  The README says the same thing in prose.
+// The cases are the shape of the W3C XML Conformance Test Suite: a
+// document is well-formed and scans to `XmlEof`, or it is not and
+// answers a fault.  Several are quoted from the suite's `xmltest`
+// collection, whose case numbers are given; conformance_tests.nv runs
+// the collection itself.
 
 use std.test
 use std.list

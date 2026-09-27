@@ -1,0 +1,209 @@
+// xmlns_tests.nv — namespaces on the tree, the tree's edges, and the
+// repairs a tolerant build makes.
+//
+// The namespace cases are XML Namespaces 1.0's own rules: a
+// declaration is scoped to its element, `xmlns=""` takes the default
+// back, the `xml` prefix needs no declaration, and the two reserved
+// URIs cannot be bound to anything else.
+
+use std.test
+use std.list
+use xmlerror
+use xmlfind
+use xmlparse
+use xmltree
+
+@test
+fn test_a_declaration_is_scoped_to_its_element() [io]
+    let doc = xmltree.build("<a xmlns=\"urn:d\"><b xmlns=\"\"><c/></b><p:e xmlns:p=\"urn:p\"/><f/></a>")
+
+    test.case("the default namespace applies to the element and its descendants")
+    test.assert(xmltree.namespace_of(doc, 1) == Some("urn:d"))
+
+    test.case("xmlns=\"\" takes it back for a subtree")
+    match xmlfind.find_descendant(doc, 1, "c")
+        Some(c) => test.assert(xmltree.namespace_of(doc, c) == None)
+        None    => test.assert(false)
+
+    test.case("a prefix declared on a sibling is not in scope after it")
+    let later = xmltree.build("<a><p:b xmlns:p=\"urn:p\"/><p:c/></a>")
+    test.assert(list.len(xmltree.issues_of(later)) == 1)
+    test.assert(xmltree.issues_of(later)[0].kind == XmlUndeclaredPrefix)
+
+    test.case("one binding declared twice is one entry")
+    let twice = xmltree.build("<r><p:a xmlns:p=\"urn:p\"/><p:b xmlns:p=\"urn:p\"/><p:c xmlns:p=\"urn:q\"/></r>")
+    test.assert(list.len(twice.namespaces) == 2)
+
+    test.case("the xml prefix is bound without a declaration, and may be declared correctly")
+    let lang = xmltree.build("<a xml:lang=\"en\"><b xmlns:xml=\"http://www.w3.org/XML/1998/namespace\" xml:space=\"x\"/></a>")
+    test.assert(list.len(xmltree.issues_of(lang)) == 0)
+    test.assert(xmltree.attr_ns(lang, 1, "http://www.w3.org/XML/1998/namespace", "lang") == Some("en"))
+    test.assert(xmltree.attr_ns(lang, 2, "http://www.w3.org/XML/1998/namespace", "space") == Some("x"))
+    test.assert(xmltree.namespace_uri(lang, "xml") == Some("http://www.w3.org/XML/1998/namespace"))
+    test.assert(xmltree.namespace_uri(lang, "nope") == None)
+    let xml_el = xmltree.build("<xml:a/>")
+    test.assert(xmltree.namespace_of(xml_el, 1) == Some("http://www.w3.org/XML/1998/namespace"))
+    test.assert(xmltree.XML_XML_NAMESPACE == 0 - 2)
+
+    test.case("a name with a colon at either end has no prefix")
+    let odd = xmltree.build("<a :b=\"1\" c:=\"2\"/>")
+    test.assert(xmltree.attr(odd, 1, ":b") == Some("1"))
+    test.assert(xmltree.attr(odd, 1, "c:") == Some("2"))
+
+@test
+fn test_the_reserved_bindings_stop_the_build() [io]
+    for src in ["<a xmlns:xml=\"urn:x\"/>", "<a xmlns:xmlns=\"urn:x\"/>", "<a xmlns:p=\"\"/>",
+                "<a xmlns:p=\"http://www.w3.org/XML/1998/namespace\"/>", "<a xmlns=\"http://www.w3.org/2000/xmlns/\"/>"]
+        test.case(src)
+        let doc = xmltree.build(src)
+        let issues = xmltree.issues_of(doc)
+        test.assert(list.len(issues) == 1)
+        test.assert(issues[0].kind == XmlBadNamespaceDeclaration)
+        test.assert(xmltree.document_element(doc) == None)
+        match xmltree.build_strict(src)
+            Ok(_)  => test.assert(false)
+            Err(f) => test.assert(f.kind == XmlBadNamespaceDeclaration)
+
+@test
+fn test_a_strict_build_refuses_an_undeclared_prefix() [io]
+    test.case("on an element")
+    match xmltree.build_strict("<p:a/>")
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(f.kind == XmlUndeclaredPrefix)
+
+    test.case("on an attribute")
+    match xmltree.build_strict("<a p:x=\"1\"/>")
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            test.assert(f.kind == XmlUndeclaredPrefix)
+            test.assert(f.at == 3)
+
+    test.case("and reads a document that declares everything")
+    match xmltree.build_strict("<p:a xmlns:p=\"urn:p\" p:x=\"1\"/>")
+        Ok(doc) => test.assert(xmltree.attr_ns(doc, 1, "urn:p", "x") == Some("1"))
+        Err(_)  => test.assert(false)
+
+@test
+fn test_the_repairs() [io]
+    test.case("an end tag closing an ancestor closes everything inside it too")
+    let doc = xmltree.build("<a><b><c>t</a><d/>")
+    let issues = xmltree.issues_of(doc)
+    test.assert(issues[0].kind == XmlMismatchedEnd)
+    test.assert(issues[0].at == 10)
+    match xmltree.node(doc, 2)
+        Some(b) => test.assert(b.span.end == 10)
+        None    => test.assert(false)
+    match xmltree.node(doc, 1)
+        Some(a) => test.assert(a.span.end == 14)
+        None    => test.assert(false)
+    test.assert(issues[1].kind == XmlMultipleRoots)
+
+    test.case("a stray end tag with nothing open")
+    let stray = xmltree.build("</x><a/>")
+    test.assert(xmltree.issues_of(stray)[0].kind == XmlStrayEnd)
+    test.assert(xmltree.document_element(stray) == Some(1))
+
+    test.case("a fault the build cannot pass is its last issue, with the tree so far")
+    let stopped = xmltree.build("<a><b/>&nope;<c/></a>")
+    let last = xmltree.issues_of(stopped)
+    test.assert(last[list.len(last) - 1].kind == XmlBadEntity)
+    test.assert(xmltree.count(stopped) == 3)
+    test.assert(stopped.truncated == false)
+
+    test.case("a limit reached marks the tree as truncated")
+    let deep = xmltree.build_with("<a><b><c/></b></a>", XmlLimits { max_depth: 1, max_attributes: 8,
+                                                                     max_name_length: 8 })
+    test.assert(deep.truncated)
+
+    test.case("a document with no element has no document element")
+    test.assert(xmltree.document_element(xmltree.build("<!-- nothing -->")) == None)
+
+    test.case("each issue has a line to print")
+    test.assert(xmltree.issue_text(doc, issues[0]) == "line 1, column 11: mismatched-end")
+
+@test
+fn test_building_from_inside_an_element() [io]
+    let src = "<feed><item><t>one</t></item><item><t>two</t></item></feed>"
+    var s = xmlparse.scanner(src)
+    var titles: [Str] = []
+    var going = true
+    while going
+        match xmlparse.next_event(s)
+            Err(_)   =>
+                going = false
+            Ok(step) =>
+                s = step.scanner
+                match step.event.kind
+                    XmlStartTag(name, _) =>
+                        if xmlparse.text_at(s, name) == "item"
+                            let item = xmltree.build_from(s)
+                            list.push(titles, xmlfind.findtext(item, 0, "t", "?"))
+                    XmlEof               =>
+                        going = false
+                    _                    =>
+                        ()
+
+    test.case("each item's content is a small tree of its own")
+    test.assert(titles == ["one", "two"])
+
+    test.case("the tree ends where the item's end tag starts")
+    let open = [XmlRange { start: 1, end: 5 }, XmlRange { start: 7, end: 11 }]
+    let inside = XmlScanner { source: src, at: 12, open: open, limits: xmlparse.default_limits(),
+                              after_root: false, doctype_seen: false }
+    let first = xmltree.build_from(inside)
+    match xmltree.node(first, 0)
+        Some(n) => test.assert(n.span.end == 22)
+        None    => test.assert(false)
+
+@test
+fn test_an_index_that_names_nothing() [io]
+    let doc = xmltree.build("<a>t<!--c--></a>")
+
+    test.case("every getter answers its empty value")
+    test.assert(xmltree.node(doc, 99) == None)
+    test.assert(xmltree.is_element(doc, 99) == false)
+    test.assert(list.len(xmltree.children(doc, 0 - 1)) == 0)
+    test.assert(list.len(xmltree.descendants(doc, 99)) == 0)
+    test.assert(xmltree.name_of(doc, 99) == None)
+    test.assert(xmltree.tag_of(doc, 2) == "")
+    test.assert(xmltree.local_of(doc, 2) == "")
+    test.assert(list.len(xmltree.attrs_of(doc, 2)) == 0)
+    test.assert(list.len(xmltree.attrs_of(doc, 99)) == 0)
+    test.assert(xmltree.text_of(doc, 99) == "")
+    test.assert(xmltree.text_of(doc, 1) == "")
+    test.assert(xmltree.text_of(doc, 3) == "c")
+    test.assert(list.len(xmlfind.ancestors(doc, 99)) == 0)
+    test.assert(xmltree.XML_NO_NODE == 0 - 1)
+    test.assert(xmltree.XML_NO_NAMESPACE == 0 - 1)
+
+    test.case("findtext answers its fallback when nothing matches")
+    test.assert(xmlfind.findtext(doc, 1, "x", "none") == "none")
+    test.assert(xmlfind.findtext_ns(doc, 1, "urn:x", "x", "none") == "none")
+
+    test.case("a comment's and an instruction's line ends are normalised")
+    let crlf = xmltree.build("<a><!--x\r\ny--><?p a\rb?></a>")
+    test.assert(xmltree.text_of(crlf, 2) == "x\ny")
+    test.assert(xmltree.text_of(crlf, 3) == "a\nb")
+
+@test
+fn test_a_hand_built_namespace_that_does_not_decode() [io]
+    // As in xmlwrite_tests.nv: a source swapped for one of the same
+    // length with a reference that does not exist.
+    let good = xmltree.build("<p:a xmlns:p=\"&amp;\"/>")
+    let bad = XmlDocument { source: "<p:a xmlns:p=\"&bad;\"/>", nodes: good.nodes, namespaces: good.namespaces,
+                            issues: good.issues, truncated: good.truncated }
+    test.assert(xmltree.namespace_of(bad, 1) == Some("&bad;"))
+
+@test
+fn test_every_kind_has_a_name() [io]
+    let kinds = [XmlUnexpectedEnd, XmlBadName, XmlBadTag, XmlMismatchedEnd, XmlStrayEnd, XmlUnquotedAttribute,
+                 XmlDuplicateAttribute, XmlBadEntity, XmlBadCharRef, XmlBadComment, XmlBadCData,
+                 XmlBadProcessingInstruction, XmlBadDeclaration, XmlUnsupportedEncoding, XmlMultipleRoots,
+                 XmlTrailingContent, XmlUndeclaredPrefix, XmlBadNamespaceDeclaration, XmlLimitExceeded, XmlBadChar]
+    var names: [Str] = []
+    for k in kinds
+        let name = xmlerror.kind_name(k)
+        test.assert(list.contains(names, name) == false)
+        list.push(names, name)
+    test.assert(list.len(names) == 20)
+    test.assert(xmlerror.kind_name(XmlLimitExceeded) == "limit-exceeded")
