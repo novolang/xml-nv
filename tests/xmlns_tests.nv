@@ -126,11 +126,10 @@ fn test_building_from_inside_an_element() [io]
     let src = "<feed><item><t>one</t></item><item><t>two</t></item></feed>"
     var s = xmlparse.scanner(src)
     var titles: [Str] = []
-    var going = true
-    while going
+    loop
         match xmlparse.next_event(s)
             Err(_)   =>
-                going = false
+                break
             Ok(step) =>
                 s = step.scanner
                 match step.event.kind
@@ -139,7 +138,7 @@ fn test_building_from_inside_an_element() [io]
                             let item = xmltree.build_from(s)
                             list.push(titles, xmlfind.findtext(item, 0, "t", "?"))
                     XmlEof               =>
-                        going = false
+                        break
                     _                    =>
                         ()
 

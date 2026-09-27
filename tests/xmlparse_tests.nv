@@ -16,39 +16,29 @@ use xmlerror
 fn events(source: Str) -> [xmlparse.XmlEvent] [io]
     var s = xmlparse.scanner(source)
     var out = []
-    var going = true
-    while going
+    loop
         match xmlparse.next_event(s)
             Err(_)   =>
-                going = false
+                break
             Ok(step) =>
                 out = list.push(out, step.event)
                 s = step.scanner
-                match step.event.kind
-                    XmlEof =>
-                        going = false
-                    _      =>
-                        going = true
+                if step.event.kind == XmlEof
+                    break
     out
 
 // The fault a document stops at, or `None` when it scans to the end.
 fn fault_of(source: Str) -> ?xmlerror.XmlFaultKind [io]
     var s = xmlparse.scanner(source)
-    var answer: ?xmlerror.XmlFaultKind = None
-    var going = true
-    while going
+    loop
         match xmlparse.next_event(s)
             Err(f)   =>
-                answer = Some(f.kind)
-                going = false
+                return Some(f.kind)
             Ok(step) =>
                 s = step.scanner
-                match step.event.kind
-                    XmlEof =>
-                        going = false
-                    _      =>
-                        going = true
-    answer
+                if step.event.kind == XmlEof
+                    return None
+    None
 
 @test
 fn test_a_well_formed_document_scans_to_eof() [io]
