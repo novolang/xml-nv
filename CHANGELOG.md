@@ -59,6 +59,13 @@ These break code written against 0.0.x.
   return, because the decoded text differs from the bytes there.
 - `xmlerror.message` answers `<kind-name> at byte <offset>`.
 
+### Toolchain
+
+- The toolchain floor is 0.13.0. The bodies are written for it and use
+  no workaround: the writer appends a string's bytes with one
+  `list.append`, and the tree builder and the tests leave an event loop
+  with `break`.
+
 ## 0.0.2 — 2026-09-15
 
 README rewritten to the package README style guide (docs/writing-a-readme.md).

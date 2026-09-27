@@ -25,7 +25,9 @@ category    = "data"
 tags        = ["xml", "parser", "pull-parser", "sax", "elementtree", "namespaces", "streaming", "sans-io"]
 repository  = "https://github.com/novolang/xml-nv"
 maintainers = ["novo-lang"]
-novo        = ">= 0.12.1"
+# 0.13.0 is the first toolchain on which `break` inside a match arm on
+# a `Result` releases the arm's payload, which the tree builder does.
+novo        = ">= 0.13.0"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.
