@@ -1,0 +1,28 @@
+// hostile_tests.nv — nesting and attribute lists a few kilobytes long.
+
+use std.test
+use xmltree
+
+@test
+fn test_deep_nesting_is_bounded() [io]
+    test.case("the strict reading refuses 300000 open elements")
+    match xmltree.build_strict("<a>".repeat(300000) + "</a>".repeat(300000))
+        Err(_) => test.assert(true)
+        Ok(_)  => test.assert(false)
+
+    test.case("the tolerant reading returns a tree")
+    let doc = xmltree.build("<a>".repeat(300000) + "</a>".repeat(300000))
+    test.assert(xmltree.count(doc) < 400000)
+
+    test.case("a text node of 300000 characters")
+    let doc2 = xmltree.build("<a>" + "x".repeat(300000) + "</a>")
+    test.assert(xmltree.count(doc2) > 1)
+
+@test
+fn test_many_attributes_are_bounded() [io]
+    var attrs = ""
+    for i in 0..20000
+        attrs = attrs + " a${i}=\"v\""
+    match xmltree.build_strict("<a" + attrs + "/>")
+        Err(_) => test.assert(true)
+        Ok(_)  => test.assert(false)
